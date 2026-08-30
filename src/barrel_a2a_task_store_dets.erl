@@ -29,7 +29,7 @@
 -behaviour(barrel_a2a_task_store).
 -behaviour(gen_server).
 
--export([open/1, put/2, get/2, delete/2, all/1, close/1, flush/1]).
+-export([open/1, put/2, get/2, delete/2, all/1, close/1, owner/1, flush/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(FLUSH_INTERVAL, 1000).
@@ -80,6 +80,12 @@ delete({Ets, Writer, Sync}, Id) ->
 
 all({Ets, _, _}) ->
     [Row || {_, Row} <- ets:tab2list(Ets)].
+
+%% The working copy lives in an ETS table the writer creates in its own
+%% `init/1', so the writer's death destroys the data. The server links
+%% it and stops when it goes.
+owner({_, Writer, _}) ->
+    Writer.
 
 close({_, Writer, _}) ->
     try

@@ -67,6 +67,7 @@
 
 -define(LINGER_MS, 100).
 -define(CANCEL_GRACE_MS, 5000).
+-define(DEFAULT_MAX_QUEUE, 100).
 
 -record(st, {
     cfg :: barrel_a2a_server_core:task_cfg(),
@@ -299,10 +300,7 @@ handle_call({send_message, Message, Req}, _From, St) ->
                     )},
                 St};
         true ->
-            St1 = do_materialize(St),
-            Task = barrel_a2a_task:add_history(St1#st.task, Message),
-            St2 = store(St1#st{task = Task, last_message = Message}),
-            {reply, ok, maybe_start_worker(St2#st{queue = St2#st.queue ++ [{Message, Req}]})}
+            queue_message(St, Message, Req)
     end;
 handle_call({cancel, Metadata}, _From, St) ->
     State = barrel_a2a_task:state(St#st.task),
@@ -476,6 +474,26 @@ stop_worker(#st{worker = {Pid, _Ref, Message}} = St) ->
     unlink(Pid),
     exit(Pid, kill),
     St#st{worker = undefined}.
+
+%% Follow-ups pile up here while a worker runs, one task at a time, so
+%% a client that sends faster than the handler works would grow this
+%% list without limit. Refuse rather than drop: a dropped message is a
+%% message the client believes was accepted.
+queue_message(#st{queue = Q, cfg = Cfg} = St, Message, Req) ->
+    case length(Q) >= maps:get(max_task_queue, Cfg, ?DEFAULT_MAX_QUEUE) of
+        true ->
+            {reply,
+                {error,
+                    barrel_a2a_error:new(
+                        rate_limited, <<"Too many messages queued on this task">>
+                    )},
+                St};
+        false ->
+            St1 = do_materialize(St),
+            Task = barrel_a2a_task:add_history(St1#st.task, Message),
+            St2 = store(St1#st{task = Task, last_message = Message}),
+            {reply, ok, maybe_start_worker(St2#st{queue = Q ++ [{Message, Req}]})}
+    end.
 
 maybe_start_worker(#st{worker = undefined, queue = [{Msg, Req} | Rest]} = St) ->
     State = barrel_a2a_task:state(St#st.task),

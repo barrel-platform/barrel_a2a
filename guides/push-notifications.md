@@ -24,8 +24,10 @@ than a connection should.
 
 Any map (even `#{}`) enables the capability; the card then advertises
 `pushNotifications`. Defaults: `ssrf_guard` true, `require_https`
-false, `timeout` 15000 ms, `max_failures` 5, `backoff` `{1000, 2}`,
-`max_backoff` 60000 ms. Hosts in `allow` skip the SSRF guard; the
+false, `timeout` 15000 ms, `max_failures` 5, `max_queue` 1000,
+`backoff` `{1000, 2}`, `max_backoff` 60000 ms. A webhook slow enough to
+fill `max_queue` loses the oldest event rather than the worker growing
+without limit; a deliberate drop is not counted as a failure. Hosts in `allow` skip the SSRF guard; the
 guard refuses `localhost`, URLs with credentials, and hosts resolving
 to loopback, private, link-local, CGNAT or unspecified addresses.
 

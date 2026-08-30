@@ -60,6 +60,9 @@
 %%%   process, so use it only where the transport tolerates that.
 %%% - `task_ttl' ms (default 3600000), `history_default' (`all' or an
 %%%   integer).
+%%% - `max_task_queue' (default 100): how many follow-up messages may
+%%%   wait while a handler runs on one task. Past it a send answers
+%%%   `rate_limited' rather than queueing without limit.
 %%% - `hsts' (default `true' when TLS), `rate_limit' hook
 %%%   `fun((ReqCtx) -> ok | {error, RetryAfterSeconds})'.
 %%% @end
@@ -97,6 +100,9 @@
     %% The two stores. `registry' is a `barrel_a2a_task_store' handle,
     %% `push_store' an ETS table; both are owned by the server process.
     registry := barrel_a2a_task_registry:table(),
+    %% The process the store depends on, when it has one (the DETS
+    %% store's writer). Linked, so its death stops the server.
+    store_owner := pid() | undefined,
     push_store := barrel_a2a_push:store(),
     %% Application behaviour.
     handler := barrel_a2a_handler:handler(),
@@ -119,6 +125,8 @@
     %% Task behaviour.
     blocking_timeout := timeout(),
     task_ttl := non_neg_integer(),
+    %% How many follow-up messages may wait while a handler runs.
+    max_task_queue := pos_integer(),
     history_default := all | non_neg_integer(),
     %% Where the bindings are mounted. `engine' is the subset handed to
     %% `barrel_a2a_http_engine:config/2'.
@@ -312,12 +320,18 @@ handle_info(expire, #{cfg := Cfg} = St) ->
     _ = barrel_a2a_task_registry:expire(maps:get(registry, Cfg), maps:get(task_ttl, Cfg)),
     {noreply, St#{timer => arm_expiry(Cfg)}};
 handle_info({'EXIT', Pid, Reason}, #{cfg := Cfg} = St) ->
-    %% The task and push supervisors are linked, not supervised (see
-    %% barrel_a2a_server_inst_sup). Losing one leaves this process
-    %% holding a dead pid, so stop and let the instance supervisor
+    %% The task and push supervisors, and a process-backed task store,
+    %% are linked but not supervised (see barrel_a2a_server_inst_sup).
+    %% Losing one leaves this process holding a dead pid, and for the
+    %% store its data as well, so stop and let the instance supervisor
     %% rebuild the whole server.
-    case Pid =:= maps:get(task_sup, Cfg) orelse Pid =:= maps:get(push_sup, Cfg) of
-        true -> {stop, {supervisor_down, Pid, Reason}, St};
+    Linked = [
+        maps:get(task_sup, Cfg),
+        maps:get(push_sup, Cfg),
+        maps:get(store_owner, Cfg)
+    ],
+    case lists:member(Pid, Linked) of
+        true -> {stop, {linked_process_down, Pid, Reason}, St};
         false -> {noreply, St}
     end;
 handle_info(_Other, St) ->
@@ -359,6 +373,8 @@ build_config(InstSup, Card0, Opts) ->
             {error, Reason} -> throw({invalid_option, {task_store, Reason}})
         end,
     PushStore = barrel_a2a_push:new_store(),
+    %% `undefined' for a store that is just data, such as the ETS one.
+    StoreOwner = barrel_a2a_task_registry:owner(Registry),
     Base = base_path(maps:get(base_path, Opts, ?DEFAULT_BASE)),
     Cfg = #{
         server => self(),
@@ -367,6 +383,7 @@ build_config(InstSup, Card0, Opts) ->
         task_sup => TaskSup,
         push_sup => PushSup,
         registry => Registry,
+        store_owner => StoreOwner,
         push_store => PushStore,
         card_base => Card,
         handler => Handler,
@@ -383,6 +400,7 @@ build_config(InstSup, Card0, Opts) ->
         dedupe_messages => maps:get(dedupe_messages, Opts, false) =:= true,
         blocking_timeout => blocking_opt(maps:get(blocking_timeout, Opts, 30000)),
         task_ttl => maps:get(task_ttl, Opts, 3600000),
+        max_task_queue => pos_int_opt(max_task_queue, maps:get(max_task_queue, Opts, 100)),
         history_default => maps:get(history_default, Opts, all),
         rate_limit => maps:get(rate_limit, Opts, undefined),
         tenant => maps:get(tenant, Opts, undefined),
@@ -420,6 +438,9 @@ schema_opt(all) -> all;
 schema_opt(false) -> false;
 schema_opt(true) -> inbound;
 schema_opt(Other) -> throw({invalid_option, {validate_schema, Other}}).
+
+pos_int_opt(_, N) when is_integer(N), N > 0 -> N;
+pos_int_opt(Key, Other) -> throw({invalid_option, {Key, Other}}).
 
 blocking_opt(infinity) -> infinity;
 blocking_opt(Ms) when is_integer(Ms), Ms > 0 -> Ms;

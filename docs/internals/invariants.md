@@ -80,6 +80,21 @@ table when it writes its final row.
 The fan-out to webhooks happens on the task process, so a slow push
 hook stalls task progress and every open stream for that task.
 
+**T11. Every queue a peer can fill has a bound and a stated policy.**
+Three accumulators grow at a rate the local node does not control, and
+each answers it differently, on purpose. The follow-up queue in
+`barrel_a2a_task_proc` refuses past `max_task_queue` with
+`rate_limited`, because silently dropping a client's message would
+have it believe the message was accepted. The delivery queue in
+`barrel_a2a_push_delivery` drops its oldest past `max_queue`, because
+push is at-least-once best effort and the newest state is what a
+receiver needs; a deliberate drop must not count toward
+`max_failures`. The replay queue in `barrel_a2a_remote_task` drops its
+oldest, because the task snapshot is folded from every event anyway,
+so the outcome survives. Task history is deliberately not bounded:
+it is protocol data, and the reference `a2a-sdk` also stores it whole
+and truncates only on read.
+
 ## Engine and transport
 
 **E1. The engine owns the mailbox of the process that calls it.**

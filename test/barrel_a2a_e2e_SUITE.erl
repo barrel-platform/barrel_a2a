@@ -35,6 +35,7 @@ groups() ->
         handler_protocol_error,
         client_timeout,
         follow_up_input_required,
+        follow_up_queue_is_bounded,
         auth_required_resume,
         list_tasks_filters,
         list_tasks_scoping,
@@ -1102,3 +1103,34 @@ tenant_mismatch(Config) ->
         Body,
         [with_body]
     ).
+
+%% Follow-ups pile up while a handler runs. Past `max_task_queue' the
+%% send is refused rather than queued without limit, and the task still
+%% finishes with every message that was accepted.
+follow_up_queue_is_bounded(Config) ->
+    {ok, Server} = start_server(#{max_task_queue => 2}),
+    try
+        Prefer = ?config(prefer, Config),
+        {ok, Agent} = barrel_a2a_client:connect(barrel_a2a_server:url(Server), #{
+            prefer => Prefer, timeout => 10000
+        }),
+        {ok, {task, Task}} = barrel_a2a_client:send(Agent, <<"slow 1500">>, #{
+            return_immediately => true
+        }),
+        Id = barrel_a2a_task:id(Task),
+        Ctx = barrel_a2a_task:context_id(Task),
+        Send = fun(Text) ->
+            barrel_a2a_client:send(Agent, Text, #{
+                task_id => Id, context_id => Ctx, return_immediately => true
+            })
+        end,
+        %% Two fit behind the running handler; the third does not.
+        ?assertMatch({ok, _}, Send(<<"echo: one">>)),
+        ?assertMatch({ok, _}, Send(<<"echo: two">>)),
+        ?assertMatch({error, #{type := rate_limited}}, Send(<<"echo: three">>)),
+        %% The queue drains and the task still finishes.
+        Final = poll_until(Agent, Id, completed, 100),
+        ?assertEqual(completed, barrel_a2a_task:state(Final))
+    after
+        barrel_a2a_server:stop(Server)
+    end.

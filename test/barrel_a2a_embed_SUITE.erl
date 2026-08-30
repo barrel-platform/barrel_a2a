@@ -28,7 +28,8 @@ all() ->
         two_servers_coexist,
         failed_start_leaves_nothing_behind,
         bad_options_are_refused,
-        losing_the_task_supervisor_stops_the_server
+        losing_the_task_supervisor_stops_the_server,
+        losing_the_task_store_writer_stops_the_server
     ].
 
 init_per_suite(Config) ->
@@ -526,3 +527,27 @@ losing_the_task_supervisor_stops_the_server(Config) ->
         {'DOWN', Ref, process, Server, _} -> ok
     after 5000 -> ct:fail(server_survived_dead_task_sup)
     end.
+
+%% Same rule for a store backed by a process: the DETS writer owns the
+%% ETS working copy, so its death takes the data with it and the server
+%% must not carry on reading a destroyed table.
+losing_the_task_store_writer_stops_the_server(_Config) ->
+    File = filename:join(
+        os:getenv("TMPDIR", "/tmp"),
+        "barrel_a2a_embed_" ++ integer_to_list(erlang:unique_integer([positive])) ++ ".dets"
+    ),
+    {ok, Server} = barrel_a2a_server:start(barrel_a2a_test_agent:card(), #{
+        handler => barrel_a2a_test_agent,
+        listen => false,
+        task_store => {barrel_a2a_task_store_dets, #{file => File}}
+    }),
+    Writer = maps:get(store_owner, barrel_a2a_server:config(Server)),
+    ?assert(is_pid(Writer)),
+    Ref = monitor(process, Server),
+    exit(Writer, kill),
+    receive
+        {'DOWN', Ref, process, Server, _} -> ok
+    after 5000 -> ct:fail(server_survived_dead_store_writer)
+    end,
+    _ = file:delete(File),
+    ok.

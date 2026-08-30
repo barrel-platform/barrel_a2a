@@ -32,6 +32,7 @@
     require_https => boolean(),
     timeout => pos_integer(),
     max_failures => pos_integer(),
+    max_queue => pos_integer(),
     backoff => {pos_integer(), number()},
     max_backoff => pos_integer(),
     http_post => fun(
@@ -57,6 +58,7 @@ normalize_opts(Opts) when is_map(Opts) ->
         require_https => false,
         timeout => 15000,
         max_failures => 5,
+        max_queue => 1000,
         backoff => {1000, 2},
         max_backoff => 60000
     },

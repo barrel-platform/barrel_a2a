@@ -30,6 +30,13 @@ to_iso(Ms) when is_integer(Ms) ->
 %% @doc Parse an RFC 3339 timestamp. Offsets other than `Z' are
 %% accepted on input and normalized to UTC; fractional seconds of any
 %% length are truncated to milliseconds.
+%%
+%% A2A says timestamps are UTC with `Z', and {@link to_iso/1} only ever
+%% writes that. Accepting an offset on input is deliberate: it is the
+%% same lenient-on-input rule as ignoring a field the schema does not
+%% declare, and it costs nothing, since an offset denotes exactly one
+%% instant. Rejecting one would refuse a request no reader could
+%% misunderstand.
 -spec from_iso(binary()) -> {ok, integer()} | error.
 from_iso(Bin) when is_binary(Bin) ->
     try

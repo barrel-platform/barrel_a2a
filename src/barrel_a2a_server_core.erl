@@ -84,7 +84,8 @@
 -type task_cfg() :: #{
     handler := barrel_a2a_handler:handler(),
     registry := barrel_a2a_task_registry:table(),
-    push_notify := undefined | fun((binary(), barrel_a2a:stream_response()) -> ok)
+    push_notify := undefined | fun((binary(), barrel_a2a:stream_response()) -> ok),
+    max_task_queue := pos_integer()
 }.
 
 %% What the request knew, carried into the task process so that a
@@ -638,7 +639,8 @@ task_cfg(Cfg) ->
     #{
         handler => maps:get(handler, Cfg),
         registry => maps:get(registry, Cfg),
-        push_notify => maps:get(push_notify, Cfg, undefined)
+        push_notify => maps:get(push_notify, Cfg, undefined),
+        max_task_queue => maps:get(max_task_queue, Cfg)
     }.
 
 attach_push(#{cfg := #{push := false}}, _Pid, Configuration) ->

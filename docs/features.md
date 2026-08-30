@@ -33,7 +33,7 @@ in another package.
 | 4.5 security objects (every SecurityScheme variant, OAuthFlows, SecurityRequirement) | `barrel_a2a_agent_card:security_scheme/2`, `barrel_a2a_schema` | done |
 | 4.6 extensions (declaration, client opt-in, echo of the active set, required enforcement, unknown ignored, no version fallback) | `barrel_a2a_extensions`, `barrel_a2a_ctx` | done |
 | 5.1 to 5.4 binding equivalence, selection, method mapping, error mapping | both bindings share `barrel_a2a_server_core`; `barrel_a2a_error` | done |
-| 5.5 to 5.7 naming, timestamps, field presence, unknown fields ignored (`validate_schema => strict` rejects them instead), duplicate JSON keys keep the last | `barrel_a2a_json`, `barrel_a2a_validate`, `barrel_a2a_schema`, `barrel_a2a_canonical` | done |
+| 5.5 to 5.7 naming, timestamps, field presence, unknown fields ignored (`validate_schema => strict` rejects them instead), duplicate JSON keys keep the last | `barrel_a2a_json`, `barrel_a2a_validate`, `barrel_a2a_schema`, `barrel_a2a_canonical` | done; two deliberate leniencies on input, both written up at their definition: a timestamp offset other than `Z` is accepted and normalized (output is always `Z`), and task history is stored unbounded and truncated on read by `historyLength`, as the reference `a2a-sdk` does |
 | 5.8 custom binding identification | `barrel_a2a_agent_card:select_interface/3`, client `transports` option | done |
 | 6 workflows (basic, streaming, multi-turn, version error, listing, push, file exchange, structured data) | `test/barrel_a2a_e2e_SUITE.erl` mirrors each example | done |
 | 7.1 to 7.5 authentication (TLS, verify every request, challenge info, authorization hook) | `barrel_a2a_auth`, `barrel_a2a_listener` TLS, HSTS | done |

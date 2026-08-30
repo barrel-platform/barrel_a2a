@@ -70,6 +70,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(POLL_MS, 1000).
+-define(MAX_QUEUE, 1000).
 
 -record(st, {
     agent :: barrel_a2a_client:agent(),
@@ -91,7 +92,7 @@
     %% until the task settles; `next/2' takes one event from `queue',
     %% or parks a puller when it is empty. `queue' only fills while
     %% there is no listener, since a listener consumes events as they
-    %% arrive.
+    %% arrive, and is capped at ?MAX_QUEUE with the oldest dropped.
     listeners = [] :: [pid()],
     waiters = [] :: [gen_server:from()],
     queue = [] :: [barrel_a2a:stream_response()],
@@ -525,8 +526,19 @@ settled_state(Task) ->
     S = barrel_a2a_task:state(Task),
     barrel_a2a_task_state:is_terminal(S) orelse barrel_a2a_task_state:is_interrupted(S).
 
-deliver(Ev, #st{listeners = [], pullers = []} = St) ->
-    St#st{queue = St#st.queue ++ [Ev]};
+%% Nobody is consuming: hold the event for a later `stream_to/2' or
+%% `next/2'. This is the only place the queue grows, and it is bounded
+%% because a handle nobody reads must not outgrow the node. Past the
+%% bound the oldest event goes, so `next/2' keeps returning the most
+%% recent progress; the task snapshot in `#st.task' is folded from
+%% every event regardless, so nothing about the final outcome is lost.
+deliver(Ev, #st{listeners = [], pullers = [], queue = Q} = St) ->
+    Trimmed =
+        case length(Q) >= ?MAX_QUEUE of
+            true -> tl(Q);
+            false -> Q
+        end,
+    St#st{queue = Trimmed ++ [Ev]};
 deliver(Ev, #st{listeners = [], pullers = [From | Rest]} = St) ->
     gen_server:reply(From, {ok, Ev}),
     St#st{pullers = Rest};

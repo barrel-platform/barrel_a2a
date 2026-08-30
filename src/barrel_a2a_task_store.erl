@@ -12,11 +12,14 @@
 %%% owner, finished_ms}'. Stores treat it as opaque except for `id'.
 %%% Rows loaded by a store after a restart carry the pid of a process
 %%% that no longer exists; the registry repairs them on open.
+%%%
+%%% A store backed by a process implements the optional {@link owner/1}
+%%% so the server can watch it; see `barrel_a2a_task_store_dets'.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_task_store).
 
--export([open/1, put/2, get/2, delete/2, all/1, close/1]).
+-export([open/1, put/2, get/2, delete/2, all/1, close/1, owner/1]).
 
 -type row() :: #{
     id := binary(),
@@ -39,6 +42,13 @@
 -callback all(State :: term()) -> [row()].
 -callback close(State :: term()) -> ok.
 
+%% The process the store depends on, if it has one. A store backed by a
+%% process must report it: the server links that process and has to
+%% notice when it dies, because the store's data usually dies with it.
+-callback owner(State :: term()) -> pid() | undefined.
+
+-optional_callbacks([owner/1]).
+
 -spec open({module(), map()}) -> {ok, handle()} | {error, term()}.
 open({Module, Opts}) ->
     case Module:open(Opts) of
@@ -57,6 +67,17 @@ delete({M, S}, Id) -> M:delete(S, Id).
 
 -spec all(handle()) -> [row()].
 all({M, S}) -> M:all(S).
+
+%% @doc The process this store depends on, or `undefined' for a store
+%% that is just data. A store that does not implement `owner/1' is
+%% taken to have none.
+-spec owner(handle()) -> pid() | undefined.
+owner({M, S}) ->
+    _ = code:ensure_loaded(M),
+    case erlang:function_exported(M, owner, 1) of
+        true -> M:owner(S);
+        false -> undefined
+    end.
 
 -spec close(handle()) -> ok.
 close({M, S}) -> M:close(S).

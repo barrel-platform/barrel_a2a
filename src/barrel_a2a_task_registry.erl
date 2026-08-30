@@ -15,7 +15,9 @@
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_task_registry).
 
--export([new/0, new/1, close/1, insert/2, update/2, delete/2, lookup/2, list/2, expire/2, all/1]).
+-export([
+    new/0, new/1, close/1, owner/1, insert/2, update/2, delete/2, lookup/2, list/2, expire/2, all/1
+]).
 
 -record(row, {
     id :: binary(),
@@ -93,6 +95,11 @@ repair(Store, Map) ->
 
 -spec close(table()) -> ok.
 close(Store) -> barrel_a2a_task_store:close(Store).
+
+%% @doc The process the store depends on, or `undefined'. The server
+%% links it and stops when it dies; see the store behaviour.
+-spec owner(table()) -> pid() | undefined.
+owner(Store) -> barrel_a2a_task_store:owner(Store).
 
 -spec insert(table(), entry()) -> ok.
 insert(Tab, Entry) ->
