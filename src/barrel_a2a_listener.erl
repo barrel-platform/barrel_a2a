@@ -86,8 +86,15 @@
 -record(state, {
     transport :: gen_tcp | ssl,
     lsock :: gen_tcp:socket() | ssl:sslsocket(),
+    %% The bound port, resolved after listen so that `port => 0' works.
     port :: inet:port_number(),
+    %% Live acceptors, used as a set: one dying is replaced after a
+    %% short backoff.
     acceptors = #{} :: #{pid() => true},
+    %% Everything an accepted connection needs (transport, TLS options,
+    %% handler, limits, the connection counter). Passed by value to
+    %% each acceptor and on to each connection process, so nothing
+    %% calls back into this gen_server on the accept path.
     conn_args :: map()
 }).
 
@@ -122,6 +129,7 @@ child_spec(Id, Opts, Handler) ->
 %% gen_server
 %%====================================================================
 
+%% @private
 init({Opts, Handler}) ->
     process_flag(trap_exit, true),
     case listen(Opts) of
@@ -150,14 +158,17 @@ init({Opts, Handler}) ->
             {stop, Reason}
     end.
 
+%% @private
 handle_call(port, _From, #state{port = Port} = State) ->
     {reply, Port, State};
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
+%% @private
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+%% @private
 handle_info({'EXIT', Pid, Reason}, #state{acceptors = Acceptors} = State) ->
     case maps:is_key(Pid, Acceptors) of
         true ->
@@ -173,6 +184,7 @@ handle_info(restart_acceptor, #state{acceptors = Acceptors, conn_args = Args} = 
 handle_info(_Msg, State) ->
     {noreply, State}.
 
+%% @private
 terminate(_Reason, #state{transport = Transport, lsock = LSock}) ->
     close(Transport, LSock),
     ok.
@@ -417,6 +429,10 @@ serve_request(Proto, Conn, StreamId, Method, Path, Headers0, Handler, Limits) ->
     end.
 
 run_handler(Proto, Conn, StreamId, Method, Path, Headers, Body, Responder, Handler) ->
+    %% `headers_sent' is a process dictionary channel between this
+    %% function and the responder closures below, which run in this same
+    %% process. It decides whether a crashing handler still gets a 500 or
+    %% whether the status line is already on the wire (invariants.md, E2).
     put(headers_sent, false),
     try
         Handler(Method, Path, Headers, Body, Responder)
@@ -516,6 +532,8 @@ request_headers(Headers0, Scheme) ->
     [{<<"x-a2a-scheme">>, Scheme} | WithHost].
 
 %% Responder closures over the negotiated protocol module + connection.
+%% They run in the request process, so they can read and write the
+%% `headers_sent' flag that `run_handler/9' set (invariants.md, E2).
 responder(Proto, Conn, StreamId) ->
     #{
         reply => fun(Status, Headers, Body) ->

@@ -28,6 +28,32 @@
 %%%
 %%% The process exits `normal' shortly after the task reaches a
 %%% terminal state; the registry keeps the snapshot for GetTask.
+%%%
+%%% == Neighbours ==
+%%%
+%%% Started by `barrel_a2a_task_sup' on behalf of
+%%% `barrel_a2a_server_core', which is also its only caller. Calls
+%%% `barrel_a2a_task_state' for every transition, `barrel_a2a_task' and
+%%% `barrel_a2a_event' to build wire objects, `barrel_a2a_handler' to
+%%% invoke the application, and `barrel_a2a_task_registry' to publish
+%%% the row.
+%%%
+%%% Specification: task lifecycle 7, streaming 3.1.2 and 3.1.6,
+%%% cancellation 3.1.4.
+%%%
+%%% == Invariants ==
+%%%
+%%% This process is the only writer of its task row; the row is written
+%%% before the matching event is published; nothing is published after a
+%%% terminal event; the linger before exit is load-bearing. See
+%%% docs/internals/invariants.md, T2 to T10.
+%%%
+%%% == Testing ==
+%%%
+%%% Start one directly with {@link start_link/1}, subscribe, then
+%%% {@link run/1}, and assert on the `{a2a_task_event, ...}' messages.
+%%% The `cfg' it needs is only the three keys of
+%%% `barrel_a2a_server_core:task_cfg()', so no server is required.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_task_proc).
@@ -43,28 +69,56 @@
 -define(CANCEL_GRACE_MS, 5000).
 
 -record(st, {
-    cfg :: map(),
+    cfg :: barrel_a2a_server_core:task_cfg(),
+    %% The task as the protocol sees it. This process is its only
+    %% writer (see docs/internals/invariants.md, T9).
     task :: barrel_a2a:task(),
     task_id :: binary(),
     context_id :: binary(),
+    %% The principal that created the task; authorization scoping
+    %% compares against it.
     owner :: barrel_a2a:principal(),
-    req :: map(),
+    %% The request context of the message being handled, replayed into
+    %% every ctx the handler receives.
+    req :: barrel_a2a_server_core:task_req(),
+    %% False until the task exists for the outside world: no registry
+    %% row, no `Task' event, invisible to GetTask and friends. Set by
+    %% the first ctx call, by any handler result other than a direct
+    %% message, or by an explicit materialize. It decides the wire
+    %% shape of the reply, so moving when it flips changes the
+    %% protocol without failing a test (ADR 0003).
     materialized = false :: boolean(),
+    %% Subscribers to `{a2a_task_event, ...}', each monitored so a
+    %% dead one is dropped.
     subscribers = #{} :: #{pid() => reference()},
+    %% The handler worker, if one is running. The reference is the
+    %% staleness guard: a result carrying any other one belongs to a
+    %% worker that was killed during cancel and is discarded.
     worker = undefined :: undefined | {pid(), reference(), barrel_a2a:message()},
-    queue = [] :: [{barrel_a2a:message(), map()}],
+    %% Follow-up messages that arrived while a worker was running.
+    %% Drained one at a time, so a handler is never concurrent for one
+    %% task.
+    queue = [] :: [{barrel_a2a:message(), barrel_a2a_server_core:task_req()}],
+    %% Set by a cancel request; a cooperative handler polls it through
+    %% `barrel_a2a_ctx:cancelled/1'.
     cancel_requested = false :: boolean(),
+    %% The message a resume replays when a paused task continues
+    %% without a client message (spec 7.6.1).
     last_message :: barrel_a2a:message(),
+    %% Terminal and winding down: the linger timer is armed and no
+    %% further message or cancel is accepted.
     done = false :: boolean()
 }).
 
 -type args() :: #{
-    cfg := map(),
+    %% Only the three keys a task needs, not the whole server config.
+    cfg := barrel_a2a_server_core:task_cfg(),
     task_id := binary(),
     context_id := binary(),
     message := barrel_a2a:message(),
     owner := barrel_a2a:principal(),
-    req := map(),
+    %% What the request knew, replayed into every handler invocation.
+    req := barrel_a2a_server_core:task_req(),
     metadata => map()
 }.
 
@@ -191,6 +245,7 @@ ctx_resume(Pid, Message) -> gen_server:call(Pid, {ctx_resume, Message}).
 %% gen_server
 %%--------------------------------------------------------------------
 
+%% @private
 init(
     #{cfg := Cfg, task_id := Id, context_id := Ctx, message := Msg, owner := Owner, req := Req} = A
 ) ->
@@ -207,6 +262,7 @@ init(
         last_message = Msg
     }}.
 
+%% @private
 handle_call(materialize, _From, St) ->
     St1 = do_materialize(St),
     {reply, {ok, St1#st.task}, St1};
@@ -307,11 +363,13 @@ handle_call({ctx_resume, Message}, _From, St) ->
 handle_call(_Other, _From, St) ->
     {reply, {error, unknown_call}, St}.
 
+%% @private
 handle_cast(run, #st{worker = undefined} = St) ->
     {noreply, start_worker(St, St#st.last_message, St#st.req, initial)};
 handle_cast(_Other, St) ->
     {noreply, St}.
 
+%% @private
 handle_info({worker_result, Ref, Result}, #st{worker = {_, Ref, _}} = St) ->
     {noreply, handle_result(Result, St#st{worker = undefined})};
 handle_info({'EXIT', Pid, Reason}, #st{worker = {Pid, _, _}} = St) ->
@@ -338,6 +396,7 @@ handle_info(linger_done, St) ->
 handle_info(_Other, St) ->
     {noreply, St}.
 
+%% @private
 terminate(_Reason, #st{materialized = true} = St) ->
     %% The store may already be gone when the server shuts down.
     try
@@ -401,12 +460,19 @@ stop_worker(#st{worker = undefined} = St) ->
 stop_worker(#st{worker = {Pid, _Ref, Message}} = St) ->
     Handler = maps:get(handler, St#st.cfg),
     Ctx = make_ctx(St, Message, St#st.req),
+    %% This blocks the task process for up to ?CANCEL_GRACE_MS, so
+    %% `handle_cancel/1' must never call back into `barrel_a2a_ctx':
+    %% the ctx action would sit in a mailbox nobody is reading and time
+    %% out (invariants.md, T4).
     {CPid, CRef} = spawn_monitor(fun() -> barrel_a2a_handler:invoke_cancel(Handler, Ctx) end),
     receive
         {'DOWN', CRef, process, CPid, _} -> ok
     after ?CANCEL_GRACE_MS ->
         exit(CPid, kill)
     end,
+    %% Unlink before kill. The worker is linked, so killing it while
+    %% still linked would deliver an exit signal here and turn a
+    %% deliberate cancel into a failed task (invariants.md, T5).
     unlink(Pid),
     exit(Pid, kill),
     St#st{worker = undefined}.
@@ -496,6 +562,11 @@ after_result(St) ->
         false -> maybe_start_worker(St)
     end.
 
+%% Terminal: stop, but not immediately. A blocking caller reads the
+%% final snapshot from this process after it has already seen the
+%% terminal event, so exiting at once turns a completed task into
+%% `task_process_down' whenever the caller is descheduled
+%% (invariants.md, T3).
 finish(St) ->
     St1 = St#st{done = true},
     erlang:send_after(?LINGER_MS, self(), linger_done),
@@ -531,6 +602,9 @@ do_materialize(#st{materialized = true} = St) ->
     St;
 do_materialize(St) ->
     St1 = St#st{materialized = true},
+    %% Row first, event second: a client that reacts to an event by
+    %% calling GetTask must not read a staler state than the event it
+    %% just saw (invariants.md, T2).
     registry_update(St1, self()),
     publish(St1, barrel_a2a_event:task(St1#st.task)).
 
@@ -546,6 +620,7 @@ transition(St, State, Message) ->
             undefined -> Task0;
             _ -> barrel_a2a_task:add_history(Task0, Msg)
         end,
+    %% Row before event, as in do_materialize/1 (invariants.md, T2).
     St1 = store(St#st{task = Task}),
     Ev = barrel_a2a_event:status_update(
         St1#st.task_id, St1#st.context_id, barrel_a2a_task:status(Task)
@@ -571,8 +646,14 @@ registry_update(St, Pid) ->
 publish(St, Event) ->
     send_all(St, {a2a_task_event, St#st.task_id, Event}),
     case maps:get(push_notify, St#st.cfg, undefined) of
-        undefined -> ok;
-        Fun -> Fun(St#st.task_id, Event)
+        undefined ->
+            ok;
+        Fun ->
+            %% Runs inside the task process: the hook must only hand the
+            %% event off (it casts to a push worker), never do the HTTP
+            %% call itself, or a slow webhook stalls the task
+            %% (invariants.md, T10).
+            Fun(St#st.task_id, Event)
     end,
     St.
 

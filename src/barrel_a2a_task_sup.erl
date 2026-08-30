@@ -16,6 +16,7 @@ start_link() ->
 start_task(Sup, Args) ->
     supervisor:start_child(Sup, [Args]).
 
+%% @private
 init([]) ->
     Child = #{
         id => task,

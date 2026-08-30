@@ -27,6 +27,7 @@ start_worker(Sup, Args) ->
         {error, _} = Error -> Error
     end.
 
+%% @private
 init([]) ->
     Flags = #{strategy => simple_one_for_one, intensity => 10, period => 10},
     Child = #{

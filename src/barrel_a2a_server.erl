@@ -68,7 +68,75 @@
 -define(DEFAULT_BASE, <<"/a2a">>).
 
 -type opts() :: map().
--type cfg() :: map().
+
+%% The resolved server configuration: what {@link start/2}'s options
+%% became once defaults were applied and the runtime was built. It is
+%% written to `persistent_term' under `{barrel_a2a_server, ServerPid}'
+%% and read on every request without a process hop, so treat it as
+%% immutable after `init/1' except through {@link update_card/2}.
+%%
+%% Built in three steps, in this order: `build_config/3' produces
+%% everything below except the last two groups, `maybe_listen/1' adds
+%% the listener keys, and `finalize_card/1' adds the published card.
+%% A reader of `server_core' or `task_proc' sees only the finished map.
+-type cfg() :: #{
+    %% Identity and the processes the server owns.
+    server := pid(),
+    started_ms := integer(),
+    inst_sup := pid(),
+    task_sup := pid(),
+    push_sup := pid(),
+    %% The two stores. `registry' is a `barrel_a2a_task_store' handle,
+    %% `push_store' an ETS table; both are owned by the server process.
+    registry := barrel_a2a_task_registry:table(),
+    push_store := barrel_a2a_push:store(),
+    %% Application behaviour.
+    handler := barrel_a2a_handler:handler(),
+    auth := barrel_a2a_auth:config(),
+    authorize := owner | any | fun((barrel_a2a:principal(), map()) -> boolean()),
+    rate_limit := undefined | fun((map()) -> ok | {error, non_neg_integer()}),
+    %% Protocol policy.
+    validate_schema := inbound | all | false,
+    streaming := boolean(),
+    push := false | barrel_a2a_push:opts(),
+    extended_card :=
+        undefined
+        | barrel_a2a:agent_card()
+        | fun((barrel_a2a:principal()) -> barrel_a2a:agent_card()),
+    supported_versions := [binary()],
+    accept_legacy_version := boolean(),
+    accept_client_context_id := boolean(),
+    dedupe_messages := boolean(),
+    tenant := undefined | binary(),
+    %% Task behaviour.
+    blocking_timeout := timeout(),
+    task_ttl := non_neg_integer(),
+    history_default := all | non_neg_integer(),
+    %% Where the bindings are mounted. `engine' is the subset handed to
+    %% `barrel_a2a_http_engine:config/2'.
+    base_path := binary(),
+    engine := map(),
+    %% Listener. `http' is the option map; `listen' says whether we own
+    %% a port at all. `listener_id', `port' and `url' are derived by
+    %% `maybe_listen/1' and absent when `listen' is `false' (except
+    %% `url', which the caller may supply for an embedded server).
+    http := map(),
+    listen := boolean(),
+    url := undefined | binary(),
+    listener_id => term(),
+    port => inet:port_number(),
+    %% Signing input, and the published card derived from `card_base'
+    %% by `finalize_card/1': `card' is what the well-known route
+    %% serves, `card_json' its encoded form, `card_etag' its ETag.
+    signing := undefined | map(),
+    card_base := barrel_a2a:agent_card(),
+    card => barrel_a2a:agent_card(),
+    card_json => binary(),
+    card_etag => binary(),
+    %% Fan-out hook called by every task process on every event, or
+    %% `undefined' when push notifications are off.
+    push_notify := undefined | fun((binary(), barrel_a2a:stream_response()) -> ok)
+}.
 
 -export_type([opts/0, cfg/0]).
 
@@ -161,6 +229,7 @@ url(Server) -> maps:get(url, config(Server), undefined).
 %% gen_server
 %%--------------------------------------------------------------------
 
+%% @private
 init({InstSup, #{card := Card0, opts := Opts}}) ->
     process_flag(trap_exit, true),
     try
@@ -179,6 +248,7 @@ init({InstSup, #{card := Card0, opts := Opts}}) ->
             {stop, {listener_failed, Reason}}
     end.
 
+%% @private
 handle_call(inst_sup, _From, #{cfg := Cfg} = St) ->
     {reply, maps:get(inst_sup, Cfg), St};
 handle_call({update_card, Card}, _From, #{cfg := Cfg} = St) ->
@@ -193,9 +263,11 @@ handle_call({update_card, Card}, _From, #{cfg := Cfg} = St) ->
 handle_call(_Other, _From, St) ->
     {reply, {error, unknown_call}, St}.
 
+%% @private
 handle_cast(_Msg, St) ->
     {noreply, St}.
 
+%% @private
 handle_info(expire, #{cfg := Cfg} = St) ->
     _ = barrel_a2a_task_registry:expire(maps:get(registry, Cfg), maps:get(task_ttl, Cfg)),
     TRef = erlang:send_after(min(maps:get(task_ttl, Cfg), 60000), self(), expire),
@@ -203,6 +275,7 @@ handle_info(expire, #{cfg := Cfg} = St) ->
 handle_info(_Other, St) ->
     {noreply, St}.
 
+%% @private
 terminate(_Reason, #{cfg := Cfg}) ->
     _ =
         case maps:get(listener_id, Cfg, undefined) of

@@ -51,5 +51,6 @@ stop_listener(Id) ->
             E
     end.
 
+%% @private
 init([]) ->
     {ok, {#{strategy => one_for_one, intensity => 3, period => 60}, []}}.

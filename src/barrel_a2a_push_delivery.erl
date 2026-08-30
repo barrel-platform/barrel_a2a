@@ -23,12 +23,19 @@
 -export([start_link/3, deliver/2, stop/1, post/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
+%% One worker per push notification configuration.
 -record(st, {
     config :: map(),
     opts :: barrel_a2a_push:opts(),
     store :: barrel_a2a_push:store(),
+    %% Events waiting to be delivered. One POST is in flight at a
+    %% time, so a webhook sees them in the order the task produced
+    %% them.
     queue = queue:new() :: queue:queue(),
+    %% Consecutive failures. Reset by any success; at `max_failures'
+    %% the configuration is dropped and this worker stops.
     failures = 0 :: non_neg_integer(),
+    %% Backoff timer between retries, not a periodic tick.
     timer :: reference() | undefined
 }).
 
@@ -105,12 +112,15 @@ hackney_post(Url, Headers, Body, Timeout) ->
 %% gen_server
 %%--------------------------------------------------------------------
 
+%% @private
 init({Config, Opts, Store}) ->
     {ok, #st{config = Config, opts = Opts, store = Store}}.
 
+%% @private
 handle_call(_Req, _From, St) ->
     {reply, {error, unsupported}, St}.
 
+%% @private
 handle_cast({deliver, Event}, #st{queue = Q} = St) ->
     drain(St#st{queue = queue:in(Event, Q)});
 handle_cast(stop, St) ->
@@ -118,11 +128,13 @@ handle_cast(stop, St) ->
 handle_cast(_, St) ->
     {noreply, St}.
 
+%% @private
 handle_info({retry, Ref}, #st{timer = Ref} = St) ->
     drain(St#st{timer = undefined});
 handle_info(_, St) ->
     {noreply, St}.
 
+%% @private
 terminate(_Reason, #st{store = Store, config = #{<<"id">> := Id}}) ->
     case ets:lookup(Store, {worker, Id}) of
         [{_, Pid}] when Pid =:= self() -> ets:delete(Store, {worker, Id});

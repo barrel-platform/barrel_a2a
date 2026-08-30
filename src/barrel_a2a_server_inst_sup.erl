@@ -22,6 +22,7 @@ server(Sup) ->
         _ -> undefined
     end.
 
+%% @private
 init(Args) ->
     %% The server process owns its task and push supervisors (linked,
     %% started from its init) so no child ever asks this supervisor

@@ -12,8 +12,10 @@
 
 -export([start/2, stop/1]).
 
+%% @private
 start(_StartType, _StartArgs) ->
     barrel_a2a_sup:start_link().
 
+%% @private
 stop(_State) ->
     ok.
