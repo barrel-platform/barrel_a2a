@@ -274,11 +274,8 @@ match_test_() ->
             {ok, get_push_config, #{<<"id">> => <<"t 1">>, <<"configId">> => <<"c:1">>}},
             match(<<"GET">>, <<"/a2a/v1/tasks/t%201/pushNotificationConfigs/c%3A1">>)
         ),
-        %% BUG: src/barrel_a2a_rest.erl uri_decode/1 matches on a
-        %% `{error, _, _}' return, but uri_string:percent_decode/1 (OTP 27+)
-        %% throws `{error, invalid_percent_encoding, _}' for a bad escape, so
-        %% the throw escapes match/3 and a crafted path crashes the request.
-        %% The doc comment says invalid escapes are left as is.
+        %% uri_string:percent_decode/1 throws on a bad escape; uri_decode/1
+        %% catches it and leaves the segment as is, as its doc comment says.
         ?_assertEqual(
             {ok, get_task, #{<<"id">> => <<"a%ZZ">>}}, match(<<"GET">>, <<"/a2a/v1/tasks/a%ZZ">>)
         ),
@@ -286,19 +283,35 @@ match_test_() ->
         ?_assertEqual({error, not_found}, match(<<"GET">>, <<"/a2a/v1/nope">>)),
         ?_assertEqual({error, not_found}, match(<<"GET">>, <<"/other/tasks">>)),
         ?_assertEqual({error, not_found}, match(<<"GET">>, <<"/a2a/v1/tasks/t1/extra/segments">>)),
-        %% a colon inside the id segment is just part of the id for GET, so an
-        %% unknown verb is a 405 against get_task rather than a 404
+        %% `resource:verb' is a custom method (AIP-136), so a bound id never
+        %% holds an unescaped colon: an unknown verb is a route that does not
+        %% exist, whatever the method.
+        ?_assertEqual({error, not_found}, match(<<"POST">>, <<"/a2a/v1/tasks/x:frobnicate">>)),
+        ?_assertEqual({error, not_found}, match(<<"GET">>, <<"/a2a/v1/tasks/x:frobnicate">>)),
+        ?_assertEqual({error, not_found}, match(<<"POST">>, <<"/a2a/v1/tasks/t1:reboot">>)),
+        ?_assertEqual({error, not_found}, match(<<"GET">>, <<"/a2a/v1/tasks/t1:reboot">>)),
+        %% an empty id before a known verb is no route either
+        ?_assertEqual({error, not_found}, match(<<"POST">>, <<"/a2a/v1/tasks/:cancel">>)),
+        %% the id left after the verb suffix follows the same rule, so a
+        %% second colon is a 404 rather than an id of `x:y'
+        ?_assertEqual({error, not_found}, match(<<"POST">>, <<"/a2a/v1/tasks/x:y:cancel">>)),
+        %% a known verb reached with the wrong method is a 405 naming it
         ?_assertEqual(
-            {error, {method_not_allowed, [<<"GET">>]}},
-            match(<<"POST">>, <<"/a2a/v1/tasks/:cancel">>)
+            {error, {method_not_allowed, [<<"POST">>]}},
+            match(<<"GET">>, <<"/a2a/v1/tasks/x:cancel">>)
         ),
         ?_assertEqual(
-            {error, {method_not_allowed, [<<"GET">>]}},
-            match(<<"POST">>, <<"/a2a/v1/tasks/t1:reboot">>)
+            {error, {method_not_allowed, [<<"POST">>]}},
+            match(<<"DELETE">>, <<"/a2a/v1/tasks/x:subscribe">>)
         ),
+        %% and reached with the right one it still binds the id
         ?_assertEqual(
-            {ok, get_task, #{<<"id">> => <<"t1:reboot">>}},
-            match(<<"GET">>, <<"/a2a/v1/tasks/t1:reboot">>)
+            {ok, cancel_task, #{<<"id">> => <<"x">>}},
+            match(<<"POST">>, <<"/a2a/v1/tasks/x:cancel">>)
+        ),
+        %% an id that genuinely contains a colon arrives percent-encoded
+        ?_assertEqual(
+            {ok, get_task, #{<<"id">> => <<"x:y">>}}, match(<<"GET">>, <<"/a2a/v1/tasks/x%3Ay">>)
         ),
         ?_assertEqual({error, not_found}, match(<<"GET">>, <<"/">>)),
         ?_assertEqual({error, not_found}, match(<<"GET">>, <<>>)),
@@ -322,14 +335,60 @@ match_test_() ->
             match(<<"PATCH">>, <<"/a2a/v1/tasks/t1/pushNotificationConfigs">>)
         ),
         ?_assertEqual(
-            %% GET on a verb path reads as get_task with the verb in the id
-            {ok, get_task, #{<<"id">> => <<"t1:subscribe">>}},
+            %% GET on a verb path names the method that serves the verb
+            {error, {method_not_allowed, [<<"POST">>]}},
             match(<<"GET">>, <<"/a2a/v1/tasks/t1:subscribe">>)
         ),
         %% methods are case sensitive
         ?_assertEqual(
             {error, {method_not_allowed, [<<"POST">>]}},
             match(<<"post">>, <<"/a2a/v1/message:send">>)
+        )
+    ].
+
+%% What the client builds is what the server matches, for an id that
+%% contains a colon and therefore travels percent-encoded.
+path_for_round_trip_test_() ->
+    Id = <<"x:y">>,
+    Cases = [
+        {get_task, #{<<"id">> => Id}, <<"id">>},
+        {cancel_task, #{<<"id">> => Id}, <<"id">>},
+        {subscribe_to_task, #{<<"id">> => Id}, <<"id">>},
+        {list_push_configs, #{<<"taskId">> => Id}, <<"id">>}
+    ],
+    [
+        ?_test(begin
+            {Method, Path} = barrel_a2a_rest:path_for(Op, <<"/a2a/v1">>, Req),
+            ?assertEqual(nomatch, binary:match(Path, <<"x:y">>)),
+            {ok, Op, Bindings} = match(Method, Path),
+            ?assertEqual(Id, maps:get(Key, Bindings))
+        end)
+     || {Op, Req, Key} <- Cases
+    ].
+
+%% The tenant prefix is stripped before the match, so the strict verb
+%% reading is the same on a tenant path.
+tenant_prefix_match_test_() ->
+    Strip = fun(Path) ->
+        {_, Stripped} = barrel_a2a_tenant:strip_prefix(<<"acme">>, {<<"/a2a/v1">>, Path}),
+        Stripped
+    end,
+    [
+        ?_assertEqual(
+            {error, not_found},
+            match(<<"POST">>, Strip(<<"/a2a/v1/acme/tasks/x:frobnicate">>))
+        ),
+        ?_assertEqual(
+            {error, {method_not_allowed, [<<"POST">>]}},
+            match(<<"GET">>, Strip(<<"/a2a/v1/acme/tasks/x:cancel">>))
+        ),
+        ?_assertEqual(
+            {ok, cancel_task, #{<<"id">> => <<"x">>}},
+            match(<<"POST">>, Strip(<<"/a2a/v1/acme/tasks/x:cancel">>))
+        ),
+        ?_assertEqual(
+            {ok, get_task, #{<<"id">> => <<"x:y">>}},
+            match(<<"GET">>, Strip(<<"/a2a/v1/acme/tasks/x%3Ay">>))
         )
     ].
 

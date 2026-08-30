@@ -70,15 +70,14 @@ match_segments([<<$:, Rest/binary>> | Ps], [S | Ss], Acc) ->
     %% `:id:cancel'. Split the pattern on the verb colon.
     case binary:split(Rest, <<":">>) of
         [Name] ->
-            match_segments(Ps, Ss, Acc#{Name => uri_decode(S)});
+            bind(Name, S, Ps, Ss, Acc);
         [Name, Verb] ->
             Suffix = <<":", Verb/binary>>,
             SLen = byte_size(S),
             VLen = byte_size(Suffix),
             case SLen > VLen andalso binary:part(S, SLen - VLen, VLen) =:= Suffix of
                 true ->
-                    Value = binary:part(S, 0, SLen - VLen),
-                    match_segments(Ps, Ss, Acc#{Name => uri_decode(Value)});
+                    bind(Name, binary:part(S, 0, SLen - VLen), Ps, Ss, Acc);
                 false ->
                     false
             end
@@ -87,6 +86,17 @@ match_segments([P | Ps], [P | Ss], Acc) ->
     match_segments(Ps, Ss, Acc);
 match_segments(_, _, _) ->
     false.
+
+%% `resource:verb' is a custom method (AIP-136), so a bound value never
+%% holds a literal colon: `path_for/3' percent-encodes one, and an
+%% unescaped colon therefore names a verb this route does not have.
+%% Checked before decoding, so `x%3Ay' still binds and decodes to
+%% `x:y'.
+bind(Name, Value, Ps, Ss, Acc) ->
+    case binary:match(Value, <<":">>) of
+        nomatch -> match_segments(Ps, Ss, Acc#{Name => uri_decode(Value)});
+        _ -> false
+    end.
 
 uri_decode(S) ->
     try uri_string:percent_decode(S) of

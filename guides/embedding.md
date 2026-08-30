@@ -61,6 +61,13 @@ Patterns use `:name` segments. The engine matches the raw path itself
 and answers 404/405 on its own, so your router only needs to send
 these paths to the handler.
 
+A `:verb` suffix such as `/tasks/:id:cancel` is a custom method
+(AIP-136), and the engine reads it strictly: an id never holds an
+unescaped colon, so an unknown verb is 404 and a known verb reached
+with the wrong method is 405 naming the method that serves it. A
+router that cannot express the suffix can forward a catch-all
+`/tasks/:id` and let the engine sort it out.
+
 ### 4. Handle a request
 
 ```erlang
