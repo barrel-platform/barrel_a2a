@@ -144,7 +144,12 @@ finished tasks readable after a restart, use the DETS store:
 
 Notes:
 
-- One file per server; `sync => true` fsyncs after every write.
+- Rows are served from ETS; a writer process flushes dirty rows to the
+  DETS file every `flush_interval` ms (default 1000) or once `flush_max`
+  rows are dirty (default 500), so the request path never waits on
+  the disk. `sync => true` makes each write wait for its flush.
+  `barrel_a2a_task_store_dets:flush/1` forces a flush. One file per
+  server.
 - A task that was still running when the server stopped cannot resume:
   on open it is marked `failed` with the status message "Task interrupted
   by a server restart". Terminal tasks keep their snapshot, artifacts and

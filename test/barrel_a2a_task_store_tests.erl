@@ -40,6 +40,58 @@ dets_round_trip_test() ->
     ok = barrel_a2a_task_registry:close(Store2),
     file:delete(File).
 
+dets_async_flush_test() ->
+    File = dets_file(),
+    {ok, Store} = barrel_a2a_task_store_dets:open(#{file => File, flush_interval => 50}),
+    Row = #{
+        id => <<"a">>,
+        pid => undefined,
+        task => #{},
+        context_id => <<"c">>,
+        state => completed,
+        status_ms => 1,
+        owner => anonymous,
+        finished_ms => 1
+    },
+    ok = barrel_a2a_task_store_dets:put(Store, Row),
+    %% The write is visible at once from memory, and reaches the file
+    %% on the next flush, without a close.
+    ?assertEqual({ok, Row}, barrel_a2a_task_store_dets:get(Store, <<"a">>)),
+    timer:sleep(200),
+    ok = barrel_a2a_task_store_dets:delete(Store, <<"a">>),
+    ok = barrel_a2a_task_store_dets:put(Store, Row#{id => <<"b">>}),
+    ok = barrel_a2a_task_store_dets:flush(Store),
+    ok = barrel_a2a_task_store_dets:close(Store),
+    {ok, Store2} = barrel_a2a_task_store_dets:open(#{file => File}),
+    ?assertEqual(error, barrel_a2a_task_store_dets:get(Store2, <<"a">>)),
+    ?assertMatch({ok, #{id := <<"b">>}}, barrel_a2a_task_store_dets:get(Store2, <<"b">>)),
+    ok = barrel_a2a_task_store_dets:close(Store2),
+    file:delete(File).
+
+dets_sync_writes_test() ->
+    File = dets_file(),
+    {ok, Store} = barrel_a2a_task_store_dets:open(#{file => File, sync => true}),
+    Row = #{
+        id => <<"s">>,
+        pid => undefined,
+        task => #{},
+        context_id => <<"c">>,
+        state => completed,
+        status_ms => 1,
+        owner => anonymous,
+        finished_ms => 1
+    },
+    ok = barrel_a2a_task_store_dets:put(Store, Row),
+    {_, Writer, _} = Store,
+    %% Kill the writer without a clean close: the row was already synced.
+    unlink(Writer),
+    exit(Writer, kill),
+    timer:sleep(50),
+    {ok, Store2} = barrel_a2a_task_store_dets:open(#{file => File}),
+    ?assertEqual({ok, Row}, barrel_a2a_task_store_dets:get(Store2, <<"s">>)),
+    ok = barrel_a2a_task_store_dets:close(Store2),
+    file:delete(File).
+
 dets_missing_file_option_test() ->
     ?assertMatch({error, {missing_option, file}}, barrel_a2a_task_store_dets:open(#{})).
 
