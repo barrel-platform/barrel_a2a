@@ -47,6 +47,9 @@
 %%%   acceptable, default `false').
 %%% - `accept_client_context_id' (default `true'), `dedupe_messages'
 %%%   (default `false': reuse the task of a repeated `messageId').
+%%% - `task_store': `{Module, Opts}' implementing `barrel_a2a_task_store'
+%%%   (default in-memory ETS; `{barrel_a2a_task_store_dets, #{file =>
+%%%   Path}}' persists tasks across restarts).
 %%% - `blocking_timeout' ms (default 30000), `task_ttl' ms (default
 %%%   3600000), `history_default' (`all' or an integer).
 %%% - `hsts' (default `true' when TLS), `rate_limit' hook
@@ -206,6 +209,7 @@ terminate(_Reason, #{cfg := Cfg}) ->
             undefined -> ok;
             Id -> barrel_a2a_listener_sup:stop_listener(Id)
         end,
+    _ = barrel_a2a_task_registry:close(maps:get(registry, Cfg)),
     _ = persistent_term:erase({?MODULE, self()}),
     ok.
 
@@ -228,7 +232,11 @@ build_config(InstSup, Card0, Opts) ->
             true -> Card0;
             false -> throw({invalid_option, {card, Card0}})
         end,
-    Registry = barrel_a2a_task_registry:new(),
+    Registry =
+        case barrel_a2a_task_registry:new(task_store_opt(maps:get(task_store, Opts, undefined))) of
+            {ok, R} -> R;
+            {error, Reason} -> throw({invalid_option, {task_store, Reason}})
+        end,
     PushStore = barrel_a2a_push:new_store(),
     Base = base_path(maps:get(base_path, Opts, ?DEFAULT_BASE)),
     Cfg = #{
@@ -279,6 +287,11 @@ authorize_opt(owner) -> owner;
 authorize_opt(any) -> any;
 authorize_opt(F) when is_function(F, 2) -> F;
 authorize_opt(Other) -> throw({invalid_option, {authorize, Other}}).
+
+task_store_opt(undefined) -> {barrel_a2a_task_store_ets, #{}};
+task_store_opt({Mod, O}) when is_atom(Mod), is_map(O) -> {Mod, O};
+task_store_opt(Mod) when is_atom(Mod) -> {Mod, #{}};
+task_store_opt(Other) -> throw({invalid_option, {task_store, Other}}).
 
 schema_opt(inbound) -> inbound;
 schema_opt(all) -> all;

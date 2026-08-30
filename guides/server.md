@@ -125,9 +125,38 @@ Options:
 - `accept_client_context_id` (default `true`), `dedupe_messages` (default `false`; when true a repeated `messageId` returns the existing task).
 - `blocking_timeout` ms (default 30000): how long a blocking `SendMessage` waits before answering with the current snapshot.
 - `task_ttl` ms (default 3600000): how long finished task snapshots stay readable.
+- `task_store`: `{Module, Opts}` implementing `barrel_a2a_task_store`. Default `{barrel_a2a_task_store_ets, #{}}` (in memory). `{barrel_a2a_task_store_dets, #{file => "tasks.dets"}}` keeps tasks across restarts; see below.
 - `history_default`: `all` or an integer applied when a request has no `historyLength`.
 - `hsts` (default `true` with TLS), `rate_limit => fun((ReqCtx) -> ok | {error, RetryAfterSeconds})`.
 - `keepalive_ms`: SSE keepalive interval, default 15000.
+
+## Persisting tasks
+
+Tasks live in memory by default and vanish with the server. To keep
+finished tasks readable after a restart, use the DETS store:
+
+```erlang
+{ok, Server} = barrel_a2a_server:start(Card, #{
+    handler => my_agent,
+    task_store => {barrel_a2a_task_store_dets, #{file => "/var/lib/my_agent/tasks.dets"}}
+}).
+```
+
+Notes:
+
+- Rows are served from ETS; a writer process flushes dirty rows to the
+  DETS file every `flush_interval` ms (default 1000) or once `flush_max`
+  rows are dirty (default 500), so the request path never waits on
+  the disk. `sync => true` makes each write wait for its flush.
+  `barrel_a2a_task_store_dets:flush/1` forces a flush. One file per
+  server.
+- A task that was still running when the server stopped cannot resume:
+  on open it is marked `failed` with the status message "Task interrupted
+  by a server restart". Terminal tasks keep their snapshot, artifacts and
+  history.
+- Any other backend implements the `barrel_a2a_task_store` behaviour
+  (`open/1`, `put/2`, `get/2`, `delete/2`, `all/1`, `close/1`) over
+  rows keyed by task id; filtering and pagination stay in the registry.
 
 ## Managing the server
 

@@ -23,7 +23,8 @@ src/    Protocol objects: barrel_a2a (constants/types), _agent_card,
         (card, JSON-RPC, REST, SSE over a responder), _listener
         (h1/h2 serve_socket hand-off) / _listener_sup, _task_proc /
         _task_sup / _task_registry, _ctx, _handler, _auth,
-        _push / _push_delivery / _push_sup
+        _push / _push_delivery / _push_sup,
+        _task_store (behaviour) + _task_store_ets / _task_store_dets
         Client: _client (facade), _remote_task, _client_transport
         (behaviour), _client_http (hackney), _client_auth, _webhook
 priv/   schema/a2a.json (official JSON Schema), jsonschema/ (metaschema)
@@ -103,6 +104,9 @@ answer with a direct Message.
 - Protocol objects are the wire JSON maps (binary camelCase keys).
   Accessor modules wrap them; there is no internal representation.
 - Every state transition goes through `barrel_a2a_task_state`.
+- Task rows go through a `barrel_a2a_task_store`; the DETS store is an
+  ETS working copy with an asynchronous flush, never a synchronous
+  disk write on the request path.
 - Auth, authorization and rate limiting are hooks; the library never
   decides policy.
 - Run `rebar3 fmt` before committing; elvis must pass. New per-module

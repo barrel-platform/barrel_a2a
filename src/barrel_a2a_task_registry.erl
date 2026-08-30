@@ -1,11 +1,13 @@
 %%%-------------------------------------------------------------------
 %%% @doc The per-server task index (ListTasks, GetTask, lookups).
 %%%
-%%% An ETS table owned by the server process. Each row holds the task
-%%% process (while it lives), the latest snapshot, and the owner
-%%% principal used for authorization scoping (specification 13.1).
-%%% Live tasks update their row on every transition; finished tasks
-%%% keep their snapshot until `task_ttl' expires.
+%%% Rows live in a `barrel_a2a_task_store' (ETS by default, DETS for
+%%% persistence). Each row holds the task process (while it lives),
+%%% the latest snapshot, and the owner principal used for authorization
+%%% scoping (specification 13.1). Live tasks update their row on every
+%%% transition; finished tasks keep their snapshot until `task_ttl'
+%%% expires. On open, rows left by a previous run whose task was still
+%%% running are marked failed: their workers are gone.
 %%%
 %%% ListTasks (3.1.4) sorts by status timestamp descending and uses an
 %%% opaque cursor `{TimestampMs, TaskId}' for pagination.
@@ -13,7 +15,7 @@
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_task_registry).
 
--export([new/0, insert/2, update/2, delete/2, lookup/2, list/2, expire/2, all/1]).
+-export([new/0, new/1, close/1, insert/2, update/2, delete/2, lookup/2, list/2, expire/2, all/1]).
 
 -record(row, {
     id :: binary(),
@@ -26,7 +28,7 @@
     finished_ms :: integer() | undefined
 }).
 
--type table() :: ets:table().
+-type table() :: barrel_a2a_task_store:handle().
 -type entry() :: #{
     id := binary(),
     pid := pid() | undefined,
@@ -50,44 +52,74 @@
 
 -spec new() -> table().
 new() ->
-    ets:new(barrel_a2a_tasks, [set, public, {keypos, #row.id}, {read_concurrency, true}]).
+    {ok, Store} = new({barrel_a2a_task_store_ets, #{}}),
+    Store.
+
+%% @doc Open a store and repair rows left by a previous run.
+-spec new({module(), map()}) -> {ok, table()} | {error, term()}.
+new(Spec) ->
+    case barrel_a2a_task_store:open(Spec) of
+        {ok, Store} ->
+            lists:foreach(fun(Row) -> repair(Store, Row) end, barrel_a2a_task_store:all(Store)),
+            {ok, Store};
+        {error, _} = E ->
+            E
+    end.
+
+%% A task whose process is gone cannot continue: terminal rows keep
+%% their snapshot, others become failed with an explanatory message.
+repair(Store, Map) ->
+    Raw = maps:get(pid, Map, undefined),
+    #row{state = State, task = Task, owner = Owner, id = Id} = Row = from_map(Map),
+    case {barrel_a2a_task_state:is_terminal(State), Raw} of
+        {true, undefined} ->
+            ok;
+        {true, _} ->
+            barrel_a2a_task_store:put(Store, to_map(Row#row{pid = undefined}));
+        {false, _} ->
+            Msg = barrel_a2a_message:agent(<<"Task interrupted by a server restart">>),
+            Failed = barrel_a2a_task:set_status(Task, failed, Msg),
+            barrel_a2a_task_store:put(
+                Store, to_map(to_row(#{id => Id, task => Failed, owner => Owner}))
+            )
+    end.
+
+-spec close(table()) -> ok.
+close(Store) -> barrel_a2a_task_store:close(Store).
 
 -spec insert(table(), entry()) -> ok.
 insert(Tab, Entry) ->
-    true = ets:insert(Tab, to_row(Entry)),
-    ok.
+    barrel_a2a_task_store:put(Tab, to_map(to_row(Entry))).
 
 %% @doc Store a new snapshot for a task. Keeps the owner and pid
 %% unless the entry carries them.
 -spec update(table(), entry()) -> ok.
 update(Tab, #{id := Id} = Entry) ->
-    case ets:lookup(Tab, Id) of
-        [Old] ->
+    case fetch(Tab, Id) of
+        {ok, Old} ->
             Merged = to_row(Entry),
             Row = Merged#row{
                 owner = maps:get(owner, Entry, Old#row.owner),
                 pid = maps:get(pid, Entry, Old#row.pid)
             },
-            true = ets:insert(Tab, Row),
-            ok;
-        [] ->
+            barrel_a2a_task_store:put(Tab, to_map(Row));
+        error ->
             insert(Tab, Entry)
     end.
 
 -spec delete(table(), binary()) -> ok.
 delete(Tab, Id) ->
-    true = ets:delete(Tab, Id),
-    ok.
+    barrel_a2a_task_store:delete(Tab, Id).
 
 -spec lookup(table(), binary()) -> {ok, entry()} | error.
 lookup(Tab, Id) ->
-    case ets:lookup(Tab, Id) of
-        [Row] -> {ok, from_row(Row)};
-        [] -> error
+    case fetch(Tab, Id) of
+        {ok, Row} -> {ok, from_row(Row)};
+        error -> error
     end.
 
 -spec all(table()) -> [entry()].
-all(Tab) -> [from_row(R) || R <- ets:tab2list(Tab)].
+all(Tab) -> [from_row(R) || R <- rows(Tab)].
 
 %% @doc Filtered, sorted, paginated listing.
 -spec list(table(), filter()) ->
@@ -98,7 +130,7 @@ list(Tab, Filter) ->
         error ->
             {error, invalid_page_token};
         {ok, Cursor} ->
-            Rows = [R || R <- ets:tab2list(Tab), matches(R, Filter)],
+            Rows = [R || R <- rows(Tab), matches(R, Filter)],
             Sorted = lists:sort(fun newer/2, Rows),
             Total = length(Sorted),
             AfterCursor = drop_until(Sorted, Cursor),
@@ -119,11 +151,11 @@ expire(Tab, TtlMs) ->
     Now = barrel_a2a_time:now_ms(),
     Old = [
         R#row.id
-     || #row{finished_ms = F, pid = undefined} = R <- ets:tab2list(Tab),
+     || #row{finished_ms = F, pid = undefined} = R <- rows(Tab),
         is_integer(F),
         Now - F > TtlMs
     ],
-    lists:foreach(fun(Id) -> ets:delete(Tab, Id) end, Old),
+    lists:foreach(fun(Id) -> barrel_a2a_task_store:delete(Tab, Id) end, Old),
     length(Old).
 
 matches(Row, Filter) ->
@@ -205,3 +237,49 @@ status_ms(Task) ->
 
 from_row(#row{id = Id, pid = Pid, task = Task, owner = Owner, state = State}) ->
     #{id => Id, pid => Pid, task => Task, owner => Owner, state => State}.
+
+%%--------------------------------------------------------------------
+%% Store access
+%%--------------------------------------------------------------------
+
+fetch(Tab, Id) ->
+    case barrel_a2a_task_store:get(Tab, Id) of
+        {ok, Map} -> {ok, from_map(Map)};
+        error -> error
+    end.
+
+rows(Tab) -> [from_map(M) || M <- barrel_a2a_task_store:all(Tab)].
+
+to_map(#row{} = R) ->
+    #{
+        id => R#row.id,
+        pid => R#row.pid,
+        task => R#row.task,
+        context_id => R#row.context_id,
+        state => R#row.state,
+        status_ms => R#row.status_ms,
+        owner => R#row.owner,
+        finished_ms => R#row.finished_ms
+    }.
+
+from_map(M) ->
+    #row{
+        id = maps:get(id, M),
+        pid = live_pid(maps:get(pid, M, undefined)),
+        task = maps:get(task, M),
+        context_id = maps:get(context_id, M, undefined),
+        state = maps:get(state, M),
+        status_ms = maps:get(status_ms, M),
+        owner = maps:get(owner, M, anonymous),
+        finished_ms = maps:get(finished_ms, M, undefined)
+    }.
+
+%% A pid read back from a persistent store may belong to a previous
+%% run of the node.
+live_pid(Pid) when is_pid(Pid) ->
+    case is_process_alive(Pid) of
+        true -> Pid;
+        false -> undefined
+    end;
+live_pid(_) ->
+    undefined.

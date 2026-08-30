@@ -339,7 +339,12 @@ handle_info(_Other, St) ->
     {noreply, St}.
 
 terminate(_Reason, #st{materialized = true} = St) ->
-    registry_update(St#st{}, undefined),
+    %% The store may already be gone when the server shuts down.
+    try
+        registry_update(St, undefined)
+    catch
+        error:badarg -> ok
+    end,
     ok;
 terminate(_Reason, _St) ->
     ok.
