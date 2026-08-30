@@ -18,6 +18,28 @@
 %%% `Subscribe(Pid)' registers `Pid' for `{a2a_task_event, TaskId,
 %%% StreamResponse}' messages and returns the events to send first,
 %%% or `{error, Error}'.
+%%%
+%%% == Neighbours ==
+%%%
+%%% Called by `barrel_a2a_http_engine' (both HTTP bindings) and by an
+%%% out-of-tree binding such as `livery_grpc_a2a'. Calls
+%%% `barrel_a2a_auth', `barrel_a2a_validate', `barrel_a2a_schema',
+%%% `barrel_a2a_task_registry', `barrel_a2a_task_proc' and
+%%% `barrel_a2a_push'.
+%%%
+%%% Specification: operations 3.1, error mapping 5.4, security 13.
+%%%
+%%% == Invariants ==
+%%%
+%%% Subscribing a caller before starting a task is a `call' and running
+%%% it is a `cast'; that asymmetry is the only thing keeping the first
+%%% events from being lost. See docs/internals/invariants.md, T1.
+%%%
+%%% == Testing ==
+%%%
+%%% Exercise it through a started server: build a `req_ctx()' by hand
+%%% and call {@link call/4} directly, without a socket. The end-to-end
+%%% suites drive the same path through the bindings.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_server_core).
@@ -34,6 +56,49 @@
     principal => barrel_a2a:principal()
 }.
 
+%% The accumulator {@link call/4} threads through the pipeline. It
+%% grows as the request is checked, so which keys are present depends
+%% on how far it has got:
+%%
+%% - `cfg', `op', `req' and `ctx' exist from the start (`call/4');
+%% - `principal' is added by `authenticate/1', the second step, so
+%%   everything after it may assume a caller identity;
+%% - `version' by `version/1' and `extensions' by `extensions/1', both
+%%   before any operation runs.
+%%
+%% By the time `dispatch/2' sees it, every key is set. A helper called
+%% from earlier in the pipeline must not assume the later ones.
+-type env() :: #{
+    cfg := barrel_a2a_server:cfg(),
+    op := barrel_a2a:op(),
+    %% The request object in its A2A JSON shape, as the binding built it.
+    req := barrel_a2a:object(),
+    ctx := req_ctx(),
+    principal => barrel_a2a:principal(),
+    version => binary(),
+    extensions => [binary()]
+}.
+
+%% The three keys a task process needs from the server config, so that
+%% a task never reads the whole thing.
+-type task_cfg() :: #{
+    handler := barrel_a2a_handler:handler(),
+    registry := barrel_a2a_task_registry:table(),
+    push_notify := undefined | fun((binary(), barrel_a2a:stream_response()) -> ok)
+}.
+
+%% What the request knew, carried into the task process so that a
+%% handler invoked later (a follow-up, a resume) still sees the
+%% context of the message that triggered it.
+-type task_req() :: #{
+    configuration := map(),
+    metadata := map(),
+    extensions := [binary()],
+    tenant := undefined | binary(),
+    principal := barrel_a2a:principal(),
+    binding := atom()
+}.
+
 -type subscribe() :: fun((pid()) -> {ok, [barrel_a2a:stream_response()]} | {error, term()}).
 
 -type reply() ::
@@ -41,7 +106,7 @@
     | {stream, subscribe()}
     | {error, barrel_a2a_error:error()}.
 
--export_type([req_ctx/0, subscribe/0, reply/0]).
+-export_type([req_ctx/0, env/0, task_cfg/0, task_req/0, subscribe/0, reply/0]).
 
 -spec call(pid(), barrel_a2a:op(), barrel_a2a:object(), req_ctx()) -> reply().
 call(Server, Op, Request, ReqCtx) ->
@@ -241,7 +306,7 @@ validate(#{cfg := Cfg, op := Op, req := Req}) ->
 schema_validate(false, _, _) ->
     ok;
 schema_validate(_, Op, Req) ->
-    case barrel_a2a_schema:validate(schema_type(Op), Req) of
+    case barrel_a2a_schema:validate(barrel_a2a_schema:request_type(Op), Req) of
         ok ->
             ok;
         {error, Errors} ->
@@ -255,18 +320,6 @@ schema_validate(_, Op, Req) ->
                 ])
             )
     end.
-
-schema_type(send_message) -> <<"SendMessageRequest">>;
-schema_type(send_streaming_message) -> <<"SendMessageRequest">>;
-schema_type(get_task) -> <<"GetTaskRequest">>;
-schema_type(list_tasks) -> <<"ListTasksRequest">>;
-schema_type(cancel_task) -> <<"CancelTaskRequest">>;
-schema_type(subscribe_to_task) -> <<"SubscribeToTaskRequest">>;
-schema_type(create_push_config) -> <<"TaskPushNotificationConfig">>;
-schema_type(get_push_config) -> <<"GetTaskPushNotificationConfigRequest">>;
-schema_type(delete_push_config) -> <<"DeleteTaskPushNotificationConfigRequest">>;
-schema_type(list_push_configs) -> <<"ListTaskPushNotificationConfigsRequest">>;
-schema_type(get_extended_agent_card) -> <<"GetExtendedAgentCardRequest">>.
 
 path_to_bin(Path) ->
     iolist_to_binary(lists:join(<<".">>, [segment(S) || S <- Path])).
@@ -441,6 +494,10 @@ send_message(#{req := Req, cfg := Cfg} = Env, Streaming) ->
                             barrel_a2a_task_proc:run(Pid),
                             {ok, #{<<"task">> => with_history(Env, Task, HistoryLength)}};
                         false ->
+                            %% Subscribe is a call and run is a cast, so the
+                            %% subscription is registered before the handler
+                            %% can produce anything. Reversing them loses the
+                            %% first events (invariants.md, T1).
                             {ok, _} = barrel_a2a_task_proc:subscribe(Pid, self()),
                             barrel_a2a_task_proc:run(Pid),
                             await_reply(Env, Pid, HistoryLength, maps:get(blocking_timeout, Cfg))
@@ -564,6 +621,7 @@ create_task(#{cfg := Cfg, principal := Principal, req := Req}, ContextId, Messag
         {error, Reason} -> fail(barrel_a2a_error:internal({task_start_failed, Reason}))
     end.
 
+-spec task_cfg(barrel_a2a_server:cfg()) -> task_cfg().
 task_cfg(Cfg) ->
     #{
         handler => maps:get(handler, Cfg),
@@ -597,6 +655,7 @@ attach_push(#{cfg := Cfg}, Pid, Configuration) ->
 
 subscribe_new(Pid) ->
     fun(Subscriber) ->
+        %% Same ordering rule as the blocking path (invariants.md, T1).
         {ok, _} = barrel_a2a_task_proc:subscribe(Pid, Subscriber),
         barrel_a2a_task_proc:run(Pid),
         {ok, []}

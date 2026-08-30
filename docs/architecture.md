@@ -19,25 +19,31 @@ barrel_a2a_sup (one_for_one)
  |           +-- acceptors -> connection processes -> h1/h2 request processes
  |
  +-- barrel_a2a_server_sup (simple_one_for_one)
- |     +-- barrel_a2a_server_inst_sup (rest_for_one)             one per server
- |           +-- task_sup  barrel_a2a_task_sup (simple_one_for_one)
- |           |     +-- barrel_a2a_task_proc                       one per task
- |           +-- push_sup  barrel_a2a_push_sup (simple_one_for_one)
- |           |     +-- barrel_a2a_push_delivery                   one per push config
- |           +-- server    barrel_a2a_server (gen_server)
- |
- +-- barrel_a2a_client_sup (simple_one_for_one)
-       +-- client transport processes started on demand
+       +-- barrel_a2a_server_inst_sup (one_for_one)              one per server
+             +-- server  barrel_a2a_server (gen_server)
+                   |  linked, started from the server's own init:
+                   +-- barrel_a2a_task_sup (simple_one_for_one)
+                   |     +-- barrel_a2a_task_proc                one per task
+                   +-- barrel_a2a_push_sup (simple_one_for_one)
+                         +-- barrel_a2a_push_delivery            one per push config
 ```
 
 `barrel_a2a_server` builds the configuration, stores it in
 `persistent_term` under `{barrel_a2a_server, Pid}` so request
 processes read it without a message hop, starts the listener (unless
 `listen => false`), finalizes the card (interfaces, capabilities,
-signature) and expires old task snapshots on a timer. `rest_for_one`
-means a crash of the task supervisor restarts the push supervisor and
-the server, but the server is the last child so the registry and the
-push store it owns are rebuilt together.
+signature) and expires old task snapshots on a timer.
+
+The server process starts and links its own task and push supervisors
+in `init/1` rather than taking them as siblings under the instance
+supervisor. They are therefore linked but not supervised: if either
+dies the server dies with it, and the instance supervisor restarts the
+whole server, which is what you want since the server owns the
+registry and the push store those children write into. The reason it
+is done this way is mechanical: a child cannot ask its own supervisor
+for a sibling while that supervisor is still starting it, and an
+earlier version that called `supervisor:which_children/1` from the
+server's `init/1` deadlocked on exactly that.
 
 `barrel_a2a_remote_task` handles on the client side are plain
 `gen_server` processes started with `gen_server:start/3`; they monitor

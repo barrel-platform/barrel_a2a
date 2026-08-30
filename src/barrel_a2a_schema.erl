@@ -14,11 +14,17 @@
 %%% {@link validate/2} checks a decoded JSON value against
 %%% `#/$defs/Type'. The bundle has no `required' lists, so a missing
 %%% field passes; a wrongly typed or unknown field does not.
+%%%
+%%% {@link request_type/1} and {@link reply_type/1} map an operation to
+%%% the `$defs' name each side validates against. They live here, next
+%%% to their only consumer, so the server core, the HTTP engine and the
+%%% client cannot drift apart.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_schema).
 
 -export([load/0, types/0, validate/2, schema/0, version/0]).
+-export([request_type/1, reply_type/1]).
 
 -define(BUNDLE_KEY, {?MODULE, bundle}).
 
@@ -52,6 +58,42 @@ validate(Type, Value) when is_binary(Type) ->
         {ok, Compiled} -> barrel_a2a_jsonschema:validate(Value, Compiled, #{});
         {error, Reason} -> {error, [{[], Reason}]}
     end.
+
+%% @doc The `$defs' name a request for `Op' is validated against.
+%%
+%% Server side, before the operation runs. Every operation has an entry:
+%% an unknown op is a bug in the dispatcher, so this deliberately has no
+%% catch-all clause and crashes instead.
+-spec request_type(barrel_a2a:op()) -> binary().
+request_type(send_message) -> <<"SendMessageRequest">>;
+request_type(send_streaming_message) -> <<"SendMessageRequest">>;
+request_type(get_task) -> <<"GetTaskRequest">>;
+request_type(list_tasks) -> <<"ListTasksRequest">>;
+request_type(cancel_task) -> <<"CancelTaskRequest">>;
+request_type(subscribe_to_task) -> <<"SubscribeToTaskRequest">>;
+request_type(create_push_config) -> <<"TaskPushNotificationConfig">>;
+request_type(get_push_config) -> <<"GetTaskPushNotificationConfigRequest">>;
+request_type(delete_push_config) -> <<"DeleteTaskPushNotificationConfigRequest">>;
+request_type(list_push_configs) -> <<"ListTaskPushNotificationConfigsRequest">>;
+request_type(get_extended_agent_card) -> <<"GetExtendedAgentCardRequest">>.
+
+%% @doc The `$defs' name a reply to `Op' is validated against.
+%%
+%% Used on both sides: by the server under `validate_schema => all' and
+%% by the client under `validate_schema => true'. Operations whose reply
+%% carries no body of its own fall back to `Struct', which accepts
+%% anything; that is why this one has a catch-all clause and
+%% {@link request_type/1} does not.
+-spec reply_type(barrel_a2a:op()) -> binary().
+reply_type(send_message) -> <<"SendMessageResponse">>;
+reply_type(get_task) -> <<"Task">>;
+reply_type(cancel_task) -> <<"Task">>;
+reply_type(list_tasks) -> <<"ListTasksResponse">>;
+reply_type(create_push_config) -> <<"TaskPushNotificationConfig">>;
+reply_type(get_push_config) -> <<"TaskPushNotificationConfig">>;
+reply_type(list_push_configs) -> <<"ListTaskPushNotificationConfigsResponse">>;
+reply_type(get_extended_agent_card) -> <<"AgentCard">>;
+reply_type(_) -> <<"Struct">>.
 
 %%====================================================================
 %% Internal

@@ -15,6 +15,34 @@
 %%% or interrupted (input_required, auth_required); a direct message
 %%% reply also settles the handle, with {@link result/2} returning
 %%% `{ok, {message, M}}'.
+%%%
+%%% == State ==
+%%%
+%%% See the `#st{}' comments below. The one thing to hold in mind is
+%%% that `listeners', `waiters' and `pullers' are three different ways
+%%% of waiting on the same stream, one per public entry point, and that
+%%% `settled' is what stops the handle answering twice.
+%%%
+%%% == Neighbours ==
+%%%
+%%% Created by `barrel_a2a_client' ({@link start/3} for a new task,
+%%% {@link attach/3} for one already running). Calls back into
+%%% `barrel_a2a_client' for every remote operation.
+%%%
+%%% Specification: streaming 3.1.2 and 3.1.6, resubscription 3.1.7.
+%%%
+%%% == Invariants ==
+%%%
+%%% A transport signals `done' or an error once and only after the last
+%%% event; opening a stream is asynchronous, so a failure arrives as a
+%%% message; an attached handle must not settle on a paused state it
+%%% was already in. See docs/internals/invariants.md, C1 to C3.
+%%%
+%%% == Testing ==
+%%%
+%%% Against a started `barrel_a2a' server in the same node: the client
+%%% and the transport are real, so the whole path is exercised. The
+%%% end-to-end suites do exactly that over both bindings.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_remote_task).
@@ -45,22 +73,43 @@
 
 -record(st, {
     agent :: barrel_a2a_client:agent(),
+    %% The snapshot, folded from every event seen so far, so the handle
+    %% can answer without a round trip.
     task :: barrel_a2a:task() | undefined,
     task_id :: binary() | undefined,
     context_id :: binary() | undefined,
     message :: barrel_a2a:message() | undefined,
+    %% The transport's stream reference while one is open. Cleared when
+    %% the handle settles on a final outcome, kept while the task is
+    %% only paused (a paused task may resume server-side).
     stream :: term() | undefined,
+    %% Decided once from the card: follow the task over SSE, or poll
+    %% GetTask on a timer when the agent does not stream.
     mode :: streaming | polling,
+    %% Three ways to be waiting, one per API: `stream_to/2' registers a
+    %% listener that is pushed every event; `result/2' blocks a waiter
+    %% until the task settles; `next/2' takes one event from `queue',
+    %% or parks a puller when it is empty. `queue' only fills while
+    %% there is no listener, since a listener consumes events as they
+    %% arrive.
     listeners = [] :: [pid()],
     waiters = [] :: [gen_server:from()],
     queue = [] :: [barrel_a2a:stream_response()],
     pullers = [] :: [gen_server:from()],
+    %% The handle has an answer: `result/2' returns at once and `next/2'
+    %% is at `eof'. Set by a terminal state, by an interrupted one
+    %% (input or auth required is an answer to the caller), by a direct
+    %% message, or by a stream error. `rearm/1' clears it when the task
+    %% goes back to work after a follow-up, so a later `result/2' waits
+    %% for the next outcome instead of returning the stale one.
     settled = false :: boolean(),
+    %% Set only when the outcome is not the task itself.
     outcome :: undefined | {message, barrel_a2a:message()} | {error, barrel_a2a_error:error()},
     poll_timer :: reference() | undefined,
     initial_request :: barrel_a2a:object() | undefined,
-    %% State a handle attached to; a paused task does not settle the
-    %% handle until it leaves that state.
+    %% The state a handle attached to with `attach/3'. Without it,
+    %% attaching to an already paused task would settle immediately on
+    %% its first snapshot and report that pause as the outcome.
     attach_state :: barrel_a2a:state() | undefined
 }).
 
@@ -163,6 +212,7 @@ stop(RT) -> gen_server:stop(RT).
 %% gen_server
 %%--------------------------------------------------------------------
 
+%% @private
 init(#{agent := Agent, owner := Owner} = Args) ->
     _ = erlang:monitor(process, Owner),
     Card = barrel_a2a_client:card(Agent),
@@ -240,6 +290,7 @@ begin_attach(TaskId, #st{agent = Agent} = St) ->
             {stop, {a2a_error, E}}
     end.
 
+%% @private
 handle_call({stream_to, Pid}, _From, St) ->
     _ = erlang:monitor(process, Pid),
     %% Replay what was queued so far, then live events.
@@ -310,9 +361,11 @@ handle_call({send, Content, Opts}, _From, #st{task_id = Id, context_id = Ctx} = 
 handle_call(_Other, _From, St) ->
     {reply, {error, unknown_call}, St}.
 
+%% @private
 handle_cast(_Msg, St) ->
     {noreply, St}.
 
+%% @private
 handle_info({a2a_stream, Ref, {event, Ev}}, #st{stream = Ref} = St) ->
     {noreply, apply_event(Ev, St)};
 handle_info({a2a_stream, Ref, {error, E}}, #st{stream = Ref} = St) ->
@@ -351,6 +404,7 @@ handle_info({'DOWN', _, process, Pid, _}, #st{listeners = L} = St) ->
 handle_info(_Other, St) ->
     {noreply, St}.
 
+%% @private
 terminate(_Reason, St) ->
     _ = cancel_current_stream(St),
     ok.

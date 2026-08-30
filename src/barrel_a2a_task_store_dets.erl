@@ -103,6 +103,7 @@ mark(Writer, Id, Op, false) ->
 %% Writer process
 %%--------------------------------------------------------------------
 
+%% @private
 init(#{file := File} = Opts) ->
     process_flag(trap_exit, true),
     Name = list_to_atom("barrel_a2a_tasks_" ++ filename:absname(File)),
@@ -120,6 +121,7 @@ init(#{file := File} = Opts) ->
             {stop, {shutdown, Reason}}
     end.
 
+%% @private
 handle_call(ets, _From, St) ->
     {reply, St#st.ets, St};
 handle_call(flush, _From, St) ->
@@ -130,6 +132,7 @@ handle_call({dirty_sync, Id, Op}, _From, St) ->
 handle_call(_Other, _From, St) ->
     {reply, {error, unknown_call}, St}.
 
+%% @private
 handle_cast({dirty, Id, Op}, #st{dirty = Dirty} = St) ->
     St1 = St#st{dirty = Dirty#{Id => Op}},
     case map_size(St1#st.dirty) >= St1#st.max of
@@ -139,11 +142,13 @@ handle_cast({dirty, Id, Op}, #st{dirty = Dirty} = St) ->
 handle_cast(_Other, St) ->
     {noreply, St}.
 
+%% @private
 handle_info(flush, St) ->
     {noreply, do_flush(St#st{timer = undefined})};
 handle_info(_Other, St) ->
     {noreply, St}.
 
+%% @private
 terminate(_Reason, St) ->
     _ = do_flush(St),
     _ = dets:close(St#st.dets),

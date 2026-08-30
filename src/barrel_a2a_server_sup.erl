@@ -25,6 +25,7 @@ start_server(Args) ->
 stop_server(Pid) ->
     supervisor:terminate_child(?MODULE, Pid).
 
+%% @private
 init([]) ->
     Child = #{
         id => barrel_a2a_server_inst_sup,

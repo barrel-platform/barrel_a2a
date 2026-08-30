@@ -549,7 +549,7 @@ with_retries(Fun, Retries, Backoff) ->
     end.
 
 validate_reply(Op, {ok, Reply}, #{validate_schema := true}) ->
-    Type = reply_type(Op),
+    Type = barrel_a2a_schema:reply_type(Op),
     case barrel_a2a_schema:validate(Type, Reply) of
         ok ->
             {ok, Reply};
@@ -562,16 +562,6 @@ validate_reply(Op, {ok, Reply}, #{validate_schema := true}) ->
     end;
 validate_reply(_, Result, _) ->
     Result.
-
-reply_type(send_message) -> <<"SendMessageResponse">>;
-reply_type(get_task) -> <<"Task">>;
-reply_type(cancel_task) -> <<"Task">>;
-reply_type(list_tasks) -> <<"ListTasksResponse">>;
-reply_type(create_push_config) -> <<"TaskPushNotificationConfig">>;
-reply_type(get_push_config) -> <<"TaskPushNotificationConfig">>;
-reply_type(list_push_configs) -> <<"ListTaskPushNotificationConfigsResponse">>;
-reply_type(get_extended_agent_card) -> <<"AgentCard">>;
-reply_type(_) -> <<"Struct">>.
 
 %% @doc Open a stream for `send_streaming_message' or
 %% `subscribe_to_task'; events go to `Owner' as documented in

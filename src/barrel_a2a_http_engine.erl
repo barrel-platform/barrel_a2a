@@ -14,6 +14,35 @@
 %%% (no authentication, cache headers per 8.6), JSON-RPC at
 %%% `{base}/jsonrpc' (9), and the REST paths of 11.3 under
 %%% `{base}/v1', optionally prefixed by `/{tenant}'.
+%%%
+%%% == State ==
+%%%
+%%% None across requests. {@link config/2} is built once at mount time
+%%% and passed in; within a request the only carried state is the
+%%% {@link frame()} closure that renders one streamed item in the shape
+%%% of the binding being served.
+%%%
+%%% == Neighbours ==
+%%%
+%%% Called by `barrel_a2a_listener' and by embedders. Calls
+%%% `barrel_a2a_jsonrpc' and `barrel_a2a_rest' to parse and render,
+%%% `barrel_a2a_sse' to frame, and `barrel_a2a_server_core' to dispatch.
+%%%
+%%% Specification: discovery 8.2 and 8.6, JSON-RPC binding 9, HTTP+JSON
+%%% binding 11.
+%%%
+%%% == Invariants ==
+%%%
+%%% `handle/6' must run in the process that owns the request mailbox: a
+%%% streaming reply consumes every message that arrives. See
+%%% docs/internals/invariants.md, E1 to E4.
+%%%
+%%% == Testing ==
+%%%
+%%% Pass a responder whose four write functions append to a list and
+%%% whose `disconnected' predicate is `fun(_) -> false end'. No socket
+%%% is needed. There is no unit suite for this module yet; the
+%%% end-to-end suites cover it through the listener.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_http_engine).
@@ -22,6 +51,19 @@
 -export([sse_headers/0]).
 
 -type responder() :: barrel_a2a_listener:responder().
+
+%% Renders one streamed item as the bytes of an SSE `data' field. Each
+%% binding builds its own: JSON-RPC wraps the item in a response
+%% envelope carrying the request id, HTTP+JSON emits the bare object.
+%%
+%% Beware: {@link stream/5} recovers which binding it is serving by
+%% calling this closure with a marker error and looking for a JSON-RPC
+%% envelope in the result (`rest_or_jsonrpc/1'). That is how an error
+%% raised before any byte is written gets the right shape and status.
+%% If you change how either binding renders an error, check that probe.
+-type frame() :: fun(
+    ({event, barrel_a2a:stream_response()} | {error, barrel_a2a_error:error()}) -> binary()
+).
 -type config() :: #{
     server := pid(),
     base_path := binary(),
@@ -34,7 +76,7 @@
     peer => term()
 }.
 
--export_type([config/0, responder/0]).
+-export_type([config/0, responder/0, frame/0]).
 
 -define(JSON, <<"application/json">>).
 
@@ -417,6 +459,13 @@ reply_error(Binding, Status, Extra, Error, Responder, Cfg) ->
 %% Streaming (9.4.2, 11.7)
 %%--------------------------------------------------------------------
 
+-spec stream(
+    barrel_a2a_server_core:subscribe(),
+    frame(),
+    barrel_a2a_server_core:req_ctx(),
+    responder(),
+    config()
+) -> ok.
 stream(Subscribe, Frame, ReqCtx, Responder, #{keepalive_ms := Keepalive} = Cfg) ->
     Hdrs = common_headers(sse_headers() ++ extension_headers(ReqCtx, Cfg), Cfg),
     case Subscribe(self()) of
@@ -437,8 +486,11 @@ stream(Subscribe, Frame, ReqCtx, Responder, #{keepalive_ms := Keepalive} = Cfg) 
             end
     end.
 
+%% Which binding a frame closure belongs to, recovered by rendering a
+%% marker error with it. Used only before `stream_start', to answer a
+%% refused subscription with a normal HTTP error in the right shape.
+-spec rest_or_jsonrpc(frame()) -> rest | jsonrpc.
 rest_or_jsonrpc(Frame) ->
-    %% Both frame funs share a shape; probe with a marker error.
     Probe = Frame({error, barrel_a2a_error:new(internal_error)}),
     case binary:match(Probe, <<"\"jsonrpc\"">>) of
         nomatch -> rest;
@@ -458,6 +510,11 @@ send_events([Ev | Rest], Frame, Responder) ->
             E
     end.
 
+%% Owns the mailbox of the process it runs in: it consumes every message
+%% until the task ends or `Disconnected' recognises a transport shutdown.
+%% An embedder must therefore call `handle/6' from the request process,
+%% never from a shared worker, or that worker loses its own messages
+%% (invariants.md, E1).
 stream_loop(Frame, Responder, Keepalive, Disconnected) ->
     receive
         {a2a_task_event, _, Ev} ->
@@ -562,7 +619,7 @@ error_headers(_) ->
 outbound_check(Op, Result, #{server := Server}) ->
     case safe_config(Server) of
         #{validate_schema := all} ->
-            case barrel_a2a_schema:validate(reply_type(Op), Result) of
+            case barrel_a2a_schema:validate(barrel_a2a_schema:reply_type(Op), Result) of
                 ok ->
                     ok;
                 {error, Errors} ->
@@ -572,16 +629,6 @@ outbound_check(Op, Result, #{server := Server}) ->
         _ ->
             ok
     end.
-
-reply_type(send_message) -> <<"SendMessageResponse">>;
-reply_type(get_task) -> <<"Task">>;
-reply_type(cancel_task) -> <<"Task">>;
-reply_type(list_tasks) -> <<"ListTasksResponse">>;
-reply_type(create_push_config) -> <<"TaskPushNotificationConfig">>;
-reply_type(get_push_config) -> <<"TaskPushNotificationConfig">>;
-reply_type(list_push_configs) -> <<"ListTaskPushNotificationConfigsResponse">>;
-reply_type(get_extended_agent_card) -> <<"AgentCard">>;
-reply_type(_) -> <<"Struct">>.
 
 %%--------------------------------------------------------------------
 %% Responder shims

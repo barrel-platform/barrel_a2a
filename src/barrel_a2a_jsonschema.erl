@@ -40,7 +40,10 @@
 %%%   <li>URIs and pointers, and the dialect's own metaschema.</li>
 %%% </ul>
 %%%
-%%% Pure functions throughout; nothing here spawns or stores.
+%%% No process of its own: compiling and validating run in the caller.
+%%% Two caches make that affordable, both write-once and safe to lose:
+%%% compiled regexes are memoised in the process dictionary, and the
+%%% dialect's metaschema is held in `persistent_term'.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_jsonschema).

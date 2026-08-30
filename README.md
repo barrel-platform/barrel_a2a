@@ -216,6 +216,14 @@ make interop-python # a2a-sdk interop suite (needs python3)
 make check         # fmt compile lint xref dialyzer eunit ct
 ```
 
+Before changing the library itself, read
+[docs/internals/tour.md](docs/internals/tour.md): it says where to
+start, what you can skip, and which files a given kind of change
+touches. [docs/internals/invariants.md](docs/internals/invariants.md)
+lists the rules the runtime relies on that no single module shows, and
+[docs/decisions](docs/decisions/README.md) records why the library is
+shaped as it is.
+
 ## License
 
 Apache-2.0

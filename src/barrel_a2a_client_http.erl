@@ -13,6 +13,28 @@
 %%% Transport options (`transport_opts' of `barrel_a2a_client'):
 %%% `timeout', `ssl_options' (hackney `ssl_options'), `proxy' and
 %%% `hackney_options' (extra hackney options).
+%%%
+%%% == State ==
+%%%
+%%% The connection is a stateless {@link conn()} map. Only a stream has
+%%% a process, and its `#st{}' record is documented at its definition:
+%%% `parser' is the SSE frame state and `buffer' the bytes not yet
+%%% forming a frame, which is why both exist.
+%%%
+%%% == Neighbours ==
+%%%
+%%% Selected by `barrel_a2a_client' through the
+%%% `barrel_a2a_client_transport' behaviour. Calls hackney and
+%%% `barrel_a2a_sse'.
+%%%
+%%% Specification: JSON-RPC binding 9, HTTP+JSON binding 11, discovery
+%%% 8.2 for {@link fetch_card/2}.
+%%%
+%%% == Testing ==
+%%%
+%%% `test/barrel_a2a_client_http_tests.erl' covers the pure parts
+%%% (option handling, URL and header building) with no network. The
+%%% streaming path needs a server; the end-to-end suites provide one.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_client_http).
@@ -141,11 +163,20 @@ cancel_stream(_Conn, Pid) when is_pid(Pid) ->
 cancel_stream(_Conn, _) ->
     ok.
 
+%% State of one stream process: it owns a single hackney request and
+%% forwards what it decodes to `owner'.
 -record(st, {
     binding :: jsonrpc | rest,
+    %% The remote task that opened the stream. Monitored, so the
+    %% stream dies with it.
     owner :: pid(),
     ref :: term(),
     status :: undefined | non_neg_integer(),
+    %% Whether the response really is an event stream. The server may
+    %% answer a stream request with a single JSON document (a direct
+    %% message, or an error), and then `buffer' is used instead of
+    %% `parser': one collects the whole body to decode at the end, the
+    %% other decodes SSE frames as they arrive.
     sse = false :: boolean(),
     parser = barrel_a2a_sse:new() :: barrel_a2a_sse:parser(),
     buffer = <<>> :: binary()
