@@ -98,6 +98,12 @@ with `barrel_a2a_client:extended_card/1`. Without the option the
 operation answers `unsupported_operation`; a fun returning
 `undefined` answers `extended_agent_card_not_configured`.
 
+The operation needs a caller to identify. A server running with
+`auth => none` has none, so it answers `unauthenticated` whatever
+`extended_card` is set to. Configure an authentication scheme, or pass
+a `principal` in the request context if your embedding authenticates
+the peer itself.
+
 ## Client credentials
 
 ```erlang

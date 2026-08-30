@@ -40,6 +40,7 @@ groups() ->
         list_tasks_scoping,
         auth_hook,
         extended_card,
+        extended_card_needs_auth,
         extensions,
         version_error,
         client_disconnect_mid_stream,
@@ -651,12 +652,34 @@ with_version(Headers) ->
 
 v1() -> {<<"a2a-version">>, <<"1.0">>}.
 
+%% The extended card is served to an authenticated caller only, and the
+%% hook sees the principal that asked for it.
 extended_card(Config) ->
+    Auth =
+        {bearer, fun
+            (<<"alice">>) -> {ok, alice};
+            (_) -> {error, unauthenticated}
+        end},
+    {ok, Server} = start_server(#{auth => Auth}),
+    try
+        Prefer = ?config(prefer, Config),
+        Url = barrel_a2a_server:url(Server),
+        {ok, Alice} = barrel_a2a_client:connect(Url, #{
+            prefer => Prefer, auth => {bearer, <<"alice">>}
+        }),
+        {ok, Agent2} = barrel_a2a_client:extended_card(Alice),
+        ?assertEqual(<<"Extended">>, barrel_a2a_agent_card:name(barrel_a2a_client:card(Agent2))),
+        ?assertEqual(<<"alice">>, barrel_a2a_agent_card:description(barrel_a2a_client:card(Agent2)))
+    after
+        barrel_a2a_server:stop(Server)
+    end.
+
+%% A server with no authentication has no authenticated caller, so it
+%% cannot serve the extended card at all.
+extended_card_needs_auth(Config) ->
     Agent = connect(Config),
-    {ok, Agent2} = barrel_a2a_client:extended_card(Agent),
-    ?assertEqual(<<"Extended">>, barrel_a2a_agent_card:name(barrel_a2a_client:card(Agent2))),
-    ?assertEqual(
-        <<"anonymous">>, barrel_a2a_agent_card:description(barrel_a2a_client:card(Agent2))
+    ?assertMatch(
+        {error, #{type := unauthenticated}}, barrel_a2a_client:extended_card(Agent)
     ).
 
 extensions(Config) ->

@@ -149,14 +149,45 @@ registry_list_test_() ->
             ?assertEqual([<<"t5">>], ids(Done)),
             {ok, Working, _, 4} = barrel_a2a_task_registry:list(Tab, #{state => working}),
             ?assertEqual(4, length(Working)),
-            {ok, After, _, 2} = barrel_a2a_task_registry:list(Tab, #{after_ms => 3000}),
-            ?assertEqual([<<"t5">>, <<"t4">>], ids(After)),
-            {ok, [], _, 0} = barrel_a2a_task_registry:list(Tab, #{after_ms => 5000}),
+            %% after_ms is inclusive, so t3 at 3000 is in
+            {ok, After, _, 3} = barrel_a2a_task_registry:list(Tab, #{after_ms => 3000}),
+            ?assertEqual([<<"t5">>, <<"t4">>, <<"t3">>], ids(After)),
+            {ok, Last, _, 1} = barrel_a2a_task_registry:list(Tab, #{after_ms => 5000}),
+            ?assertEqual([<<"t5">>], ids(Last)),
+            {ok, [], _, 0} = barrel_a2a_task_registry:list(Tab, #{after_ms => 5001}),
             %% filters combine
-            {ok, Combined, _, 1} = barrel_a2a_task_registry:list(Tab, #{
+            {ok, Combined, _, 2} = barrel_a2a_task_registry:list(Tab, #{
                 owner => alice, context_id => <<"odd">>, state => working, after_ms => 1000
             }),
-            ?assertEqual([<<"t3">>], ids(Combined))
+            ?assertEqual([<<"t3">>, <<"t1">>], ids(Combined))
+        end),
+        %% a `visible' predicate is applied with the other filters, so
+        %% the total and the page describe only what the caller may see
+        ?_test(begin
+            Tab = barrel_a2a_task_registry:new(),
+            seed(Tab),
+            Odd = fun(#{id := Id}) -> binary:last(Id) rem 2 =:= 1 end,
+            {ok, Rows, Next, Total} = barrel_a2a_task_registry:list(Tab, #{
+                visible => Odd, page_size => 2
+            }),
+            ?assertEqual(3, Total),
+            ?assertEqual([<<"t5">>, <<"t3">>], ids(Rows)),
+            {ok, Rest, <<>>, 3} = barrel_a2a_task_registry:list(Tab, #{
+                visible => Odd, page_size => 2, page_token => Next
+            }),
+            ?assertEqual([<<"t1">>], ids(Rest))
+        end),
+        %% page_size is clamped to the range the specification gives
+        ?_test(begin
+            Tab = barrel_a2a_task_registry:new(),
+            seed(Tab),
+            {ok, Big, _, 5} = barrel_a2a_task_registry:list(Tab, #{page_size => 1000}),
+            ?assertEqual(5, length(Big)),
+            {ok, One, _, 5} = barrel_a2a_task_registry:list(Tab, #{page_size => 1}),
+            ?assertEqual([<<"t5">>], ids(One)),
+            %% zero and nonsense fall back to the default
+            {ok, Zero, _, 5} = barrel_a2a_task_registry:list(Tab, #{page_size => 0}),
+            ?assertEqual(5, length(Zero))
         end),
         %% pagination with cursor round trip
         ?_test(begin

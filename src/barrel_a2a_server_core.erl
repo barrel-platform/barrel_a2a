@@ -244,9 +244,14 @@ extensions(#{cfg := Cfg, ctx := Ctx} = Env) ->
             )
     end.
 
-capability(#{cfg := Cfg, op := Op}) ->
+capability(#{cfg := Cfg, op := Op, principal := Principal}) ->
     Card = maps:get(card, Cfg),
     case Op of
+        get_extended_agent_card when Principal =:= anonymous ->
+            %% "Gets the extended agent card for the authenticated
+            %% agent" (a2a.proto). A server running with `auth => none'
+            %% has no authenticated caller, so it cannot serve it.
+            fail(barrel_a2a_error:new(unauthenticated));
         _ when Op =:= send_streaming_message; Op =:= subscribe_to_task ->
             case maps:get(streaming, Cfg) andalso barrel_a2a_agent_card:supports(Card, streaming) of
                 true ->
@@ -305,8 +310,16 @@ validate(#{cfg := Cfg, op := Op, req := Req}) ->
 
 schema_validate(false, _, _) ->
     ok;
-schema_validate(_, Op, Req) ->
-    case barrel_a2a_schema:validate(barrel_a2a_schema:request_type(Op), Req) of
+schema_validate(Mode, Op, Req) ->
+    %% `strict' rejects a field the bundle does not declare; every other
+    %% mode ignores it, which is what forward compatibility asks of a
+    %% server reading a request from a newer minor version (5.7).
+    Strictness =
+        case Mode of
+            strict -> strict;
+            _ -> lenient
+        end,
+    case barrel_a2a_schema:validate(barrel_a2a_schema:request_type(Op), Req, Strictness) of
         ok ->
             ok;
         {error, Errors} ->
@@ -368,12 +381,11 @@ dispatch(list_tasks, #{req := Req, cfg := Cfg} = Env) ->
         {error, invalid_page_token} ->
             fail(barrel_a2a_error:invalid(<<"pageToken">>, <<"invalid page token">>));
         {ok, Entries, Next, Total} ->
-            Visible = [E || E <- Entries, authorized(Env, E)],
             HistoryLength = maps:get(<<"historyLength">>, Req, undefined),
             IncludeArtifacts = maps:get(<<"includeArtifacts">>, Req, false) =:= true,
             Tasks = [
                 list_task(Env, snapshot(E), HistoryLength, IncludeArtifacts)
-             || E <- Visible
+             || E <- Entries
             ],
             {ok, #{
                 <<"tasks">> => Tasks,
@@ -828,10 +840,15 @@ authorized(#{cfg := #{authorize := Fun}, principal := P}, Entry) ->
         _:_ -> false
     end.
 
+%% Push the authorization rule into the registry filter so that it is
+%% applied before the total is counted and the page is cut. `owner'
+%% becomes an indexed key; a custom hook travels as a predicate.
+scope_filter(#{cfg := #{authorize := any}}, Filter) ->
+    Filter;
 scope_filter(#{cfg := #{authorize := owner}, principal := P}, Filter) ->
     Filter#{owner => P};
-scope_filter(_, Filter) ->
-    Filter.
+scope_filter(Env, Filter) ->
+    Filter#{visible => fun(Entry) -> authorized(Env, Entry) end}.
 
 %% The latest snapshot: from the live process when there is one.
 snapshot(#{pid := Pid, task := Task}) when is_pid(Pid) ->

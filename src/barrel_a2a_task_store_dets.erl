@@ -106,7 +106,10 @@ mark(Writer, Id, Op, false) ->
 %% @private
 init(#{file := File} = Opts) ->
     process_flag(trap_exit, true),
-    Name = list_to_atom("barrel_a2a_tasks_" ++ filename:absname(File)),
+    %% A dets table name is any term, so the absolute path is used
+    %% directly. Deriving an atom from it would leak one per distinct
+    %% file, and atoms are never collected.
+    Name = {?MODULE, filename:absname(File)},
     case dets:open_file(Name, [{file, File}, {type, set}]) of
         {ok, Dets} ->
             Ets = ets:new(barrel_a2a_tasks, [set, public, {read_concurrency, true}]),

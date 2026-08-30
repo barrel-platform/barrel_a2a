@@ -142,13 +142,6 @@ unknown_type_is_refused(_Config) ->
     ),
     ?assertNot(lists:member(<<"Nope">>, barrel_a2a_schema:types())).
 
-%% PLACEHOLDER: the server-side check is added once the server exists.
-%% It drives the protocol core for the responses a client sees most
-%% (SendMessageResponse, Task, StreamResponse, ListTasksResponse,
-%% AgentCard) and validates what goes on the wire against the same
-%% types.
-%%
-
 %% Everything the server emits validates against the bundle: replies of
 %% every unary operation, every streamed event, and the published card.
 our_responses_validate(_Config) ->
@@ -160,7 +153,13 @@ our_responses_validate(_Config) ->
         extended_card => barrel_a2a_test_agent:card(#{name => <<"Extended">>})
     }),
     try
-        Ctx = #{binding => grpc, headers => [], version => <<"1.0">>, extensions => []},
+        Ctx = #{
+            binding => grpc,
+            headers => [],
+            version => <<"1.0">>,
+            extensions => [],
+            principal => <<"vectors">>
+        },
         Call = fun(Op, Req) ->
             {ok, Reply} = barrel_a2a_server_core:call(Server, Op, Req, Ctx),
             Reply

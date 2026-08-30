@@ -137,7 +137,21 @@ no process hop, and erased in `terminate/2`. Reads that can happen
 after a server stops go through the guarded helper in the engine.
 
 **F2. Building the config reads it back.** The `init/1` of
-`barrel_a2a_server` writes a partial config, starts the listener (whose handler builds an
-engine config by reading the term), then writes the complete one. The
-double write is deliberate; do not collapse it without breaking that
-cycle another way.
+`barrel_a2a_server` writes a partial config, starts the listener (whose
+handler builds an engine config by reading the term), then writes the
+complete one. The write is repeated at each step deliberately; do not
+collapse it without breaking that cycle another way.
+
+**F3. A failed `init/1` has to clean up after itself.** Returning
+`{stop, _}` from `init/1`, or crashing in it, does not run
+`terminate/2`. `undo/1` erases the `persistent_term` entry, closes the
+registry and stops a listener that already started. It reads the
+partial config back from `persistent_term`, which is why F2's repeated
+write matters for more than the listener.
+
+**F4. The task and push supervisors are linked, not supervised.** The
+server starts them from its own `init/1` (see
+`barrel_a2a_server_inst_sup` for why). It therefore traps exits and
+turns the death of either into its own `{stop, _}`, so the instance
+supervisor rebuilds the whole server rather than leaving one holding a
+dead pid.

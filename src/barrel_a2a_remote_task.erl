@@ -147,7 +147,7 @@ next(RT, Timeout) ->
     try
         gen_server:call(RT, next, Timeout)
     catch
-        exit:{timeout, _} -> {error, timeout}
+        exit:{timeout, _} -> give_up(RT)
     end.
 
 -spec result(pid()) -> {ok, barrel_a2a:task() | {message, barrel_a2a:message()}} | {error, term()}.
@@ -159,8 +159,16 @@ result(RT, Timeout) ->
     try
         gen_server:call(RT, result, Timeout)
     catch
-        exit:{timeout, _} -> {error, timeout}
+        exit:{timeout, _} -> give_up(RT)
     end.
+
+%% A timed-out `gen_server:call' leaves the caller registered in
+%% `pullers' or `waiters', where nothing would ever remove it: the
+%% caller is still alive, so no monitor fires. Tell the handle to drop
+%% it before returning.
+give_up(RT) ->
+    gen_server:cast(RT, {give_up, self()}),
+    {error, timeout}.
 
 %% @doc Re-fetch the task with GetTask.
 -spec refresh(pid()) -> {ok, barrel_a2a:task()} | {error, barrel_a2a_error:error()}.
@@ -291,16 +299,23 @@ begin_attach(TaskId, #st{agent = Agent} = St) ->
     end.
 
 %% @private
-handle_call({stream_to, Pid}, _From, St) ->
-    _ = erlang:monitor(process, Pid),
-    %% Replay what was queued so far, then live events.
-    lists:foreach(fun(Ev) -> Pid ! {a2a_event, self(), Ev} end, St#st.queue),
-    St1 = St#st{listeners = [Pid | St#st.listeners], queue = []},
-    case St1#st.settled of
-        true -> notify_done([Pid], St1);
-        false -> ok
-    end,
-    {reply, ok, St1};
+handle_call({stream_to, Pid}, _From, #st{listeners = L} = St) ->
+    %% Idempotent: registering the same process twice would monitor it
+    %% twice and deliver every event to it twice.
+    case lists:member(Pid, L) of
+        true ->
+            {reply, ok, St};
+        false ->
+            _ = erlang:monitor(process, Pid),
+            %% Replay what was queued so far, then live events.
+            lists:foreach(fun(Ev) -> Pid ! {a2a_event, self(), Ev} end, St#st.queue),
+            St1 = St#st{listeners = [Pid | L], queue = []},
+            case St1#st.settled of
+                true -> notify_done([Pid], St1);
+                false -> ok
+            end,
+            {reply, ok, St1}
+    end;
 handle_call(next, _From, #st{queue = [Ev | Rest]} = St) ->
     {reply, {ok, Ev}, St#st{queue = Rest}};
 handle_call(next, _From, #st{queue = [], settled = true} = St) ->
@@ -362,6 +377,12 @@ handle_call(_Other, _From, St) ->
     {reply, {error, unknown_call}, St}.
 
 %% @private
+handle_cast({give_up, Pid}, #st{waiters = W, pullers = P} = St) ->
+    Mine = fun({Caller, _Tag}) -> Caller =:= Pid end,
+    {noreply, St#st{
+        waiters = lists:filter(fun(F) -> not Mine(F) end, W),
+        pullers = lists:filter(fun(F) -> not Mine(F) end, P)
+    }};
 handle_cast(_Msg, St) ->
     {noreply, St}.
 
