@@ -1,0 +1,42 @@
+# Build artifacts
+_build/
+_checkouts/
+ebin/
+*.beam
+
+# Examples: _checkouts symlinks created by `make examples-setup'
+examples/*/_checkouts/
+
+# Python interop venv created by `make interop-setup'
+test/interop/.venv/
+test/interop/__pycache__/
+
+# Claude Code scratch
+.claude/
+
+# Rebar3
+rebar3.crashdump
+erl_crash.dump
+
+# IDE/Editor
+.idea/
+*.swp
+*~
+.vscode/
+
+# OS
+.DS_Store
+
+# Test artifacts
+.eunit/
+cover/
+*.coverdata
+logs/
+
+# Documentation
+doc/
+edoc/
+
+# Dialyzer
+.plt/
+*.plt

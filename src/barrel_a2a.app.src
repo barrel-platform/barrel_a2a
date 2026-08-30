@@ -1,0 +1,23 @@
+{application, barrel_a2a, [
+    {description, "Agent2Agent (A2A) protocol: core objects, client and server"},
+    {vsn, "0.1.0"},
+    {registered, [barrel_a2a_sup, barrel_a2a_server_sup, barrel_a2a_client_sup]},
+    {mod, {barrel_a2a_app, []}},
+    {applications, [kernel, stdlib, crypto, ssl, public_key, h1, h2, hackney]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/barrel-platform/barrel_a2a"}]},
+    {files, [
+        "src",
+        "include",
+        "priv/schema",
+        "priv/jsonschema",
+        "rebar.config",
+        "README.md",
+        "LICENSE",
+        "CHANGELOG.md",
+        "guides",
+        "docs"
+    ]}
+]}.

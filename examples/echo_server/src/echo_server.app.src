@@ -1,0 +1,9 @@
+{application, echo_server, [
+    {description, "barrel_a2a example: echo_server"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib, barrel_a2a]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]}
+]}.
