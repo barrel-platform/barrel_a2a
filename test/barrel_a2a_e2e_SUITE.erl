@@ -973,7 +973,26 @@ malformed_request(Config) ->
                     }
                 },
                 decode(B5)
-            )
+            ),
+            %% `resource:verb' is a custom method: an unknown verb is no
+            %% route, and a known one reached with the wrong method names
+            %% the method that serves it.
+            {ok, 404, _, B6} = hackney:request(
+                post, <<R/binary, "/tasks/x:frobnicate">>, [v1()], <<>>, [with_body | HOpts]
+            ),
+            ?assertMatch(
+                #{
+                    <<"error">> := #{
+                        <<"code">> := 404,
+                        <<"details">> := [#{<<"reason">> := <<"METHOD_NOT_FOUND">>} | _]
+                    }
+                },
+                decode(B6)
+            ),
+            {ok, 405, H7, _} = hackney:request(
+                get, <<R/binary, "/tasks/x:cancel">>, [v1()], <<>>, [with_body | HOpts]
+            ),
+            ?assertEqual(<<"POST">>, proplists:get_value(<<"allow">>, H7))
     end.
 
 decode(Body) ->

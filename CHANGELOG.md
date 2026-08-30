@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Pluggable task storage: `barrel_a2a_task_store` behaviour with ETS (default) and DETS backends; `task_store` server option.
+- The REST binding reads a `:verb` segment strictly as a custom method (AIP-136): a path binding no longer matches an unescaped colon, so an unknown verb is 404 and a known verb reached with the wrong method is 405 naming that method. Percent-encoded colon ids are unaffected.
 
 ## 0.1.0
 

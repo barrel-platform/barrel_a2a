@@ -186,7 +186,21 @@ rest_through_fake_responder(Config) ->
     {404, _, Body3} = reply(),
     ?assertMatch(
         {ok, #{<<"error">> := #{<<"status">> := <<"NOT_FOUND">>}}}, barrel_a2a_json:decode(Body3)
-    ).
+    ),
+    %% The engine reads `resource:verb' strictly, on this path too.
+    handle(Config, <<"POST">>, <<"/a2a/v1/tasks/x:frobnicate">>, json_headers(), <<>>),
+    {404, _, Body4} = reply(),
+    ?assertMatch(
+        {ok, #{
+            <<"error">> := #{
+                <<"details">> := [#{<<"reason">> := <<"METHOD_NOT_FOUND">>} | _]
+            }
+        }},
+        barrel_a2a_json:decode(Body4)
+    ),
+    handle(Config, <<"GET">>, <<"/a2a/v1/tasks/x:cancel">>, json_headers(), <<>>),
+    {405, Headers5, _} = reply(),
+    ?assertEqual(<<"POST">>, proplists:get_value(<<"allow">>, Headers5)).
 
 stream_through_fake_responder(Config) ->
     Req = #{<<"message">> => barrel_a2a_message:new(<<"stream">>)},
