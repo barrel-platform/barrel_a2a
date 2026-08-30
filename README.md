@@ -32,6 +32,8 @@ This library implements the A2A boundary only; see
   push configs and a webhook receiver helper.
 - Validation: structural checks plus JSON Schema 2020-12 validation
   against the official `a2a.json`.
+- Pluggable task storage (`barrel_a2a_task_store`): in memory by
+  default, DETS for tasks that survive a restart.
 
 ## What it deliberately does not do
 

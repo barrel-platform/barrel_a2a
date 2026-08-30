@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Pluggable task storage: `barrel_a2a_task_store` behaviour with ETS (default) and DETS backends; `task_store` server option.
+
 ## 0.1.0
 
 First release. Implements A2A v1.0.1 without the gRPC binding.

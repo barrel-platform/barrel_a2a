@@ -126,7 +126,8 @@ materialized: registry row written, Task snapshot sent to subscribers
   v
 terminal (completed | failed | canceled | rejected)
   final snapshot to the registry, linger 100 ms, exit normal
-  registry keeps the snapshot until task_ttl
+  registry keeps the snapshot until task_ttl (in the configured
+  barrel_a2a_task_store: ETS by default, DETS for persistence)
 ```
 
 The handler runs in a worker process linked to the task process. Its
