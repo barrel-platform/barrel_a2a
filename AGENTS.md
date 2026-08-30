@@ -44,6 +44,15 @@ Authoritative behaviour is the test suites under `test/`, the spec
 (`docs/a2a.proto` and https://a2a-protocol.org/latest/specification),
 and the module docs.
 
+Read before changing the runtime: `docs/internals/tour.md` (where to
+start, what a change touches), `docs/internals/invariants.md` (the
+rules no single module shows, such as subscribe before run and
+registry write before event publication),
+`docs/internals/messages.md` (every inter-process message) and
+`docs/internals/adding-an-operation.md`. `docs/decisions/` records why
+the library is shaped as it is; add a record rather than editing one
+when a decision changes.
+
 ## Required Checks
 
 Every change must be formatted and pass all checks before committing
