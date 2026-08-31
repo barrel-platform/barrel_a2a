@@ -116,14 +116,20 @@ Options:
 - `card_path` (default `/.well-known/agent-card.json`), `card_cache_max_age` seconds (default 3600).
 - `tenant`: see [Multi-tenancy](multi-tenancy.md).
 - `auth`, `authorize` (`owner` default, `any`, or `fun((Principal, TaskEntry) -> boolean())`): see [Authentication](authentication.md).
-- `validate_schema`: `inbound` (default), `all` (replies too), `false`.
+- `validate_schema`: `inbound` (default: checks requests against the A2A
+  schema and ignores fields it does not declare), `strict` (as `inbound`,
+  but an undeclared field is rejected), `all` (replies too), `false`.
 - `push_notifications`: `false` (default) or a map; enables the capability. See [Push notifications](push-notifications.md).
 - `streaming`: capability flag, default `true`.
-- `extended_card`: a card or `fun((Principal) -> Card)`; enables the capability.
+- `extended_card`: a card or `fun((Principal) -> Card)`; enables the capability. Served only to an authenticated caller.
 - `signing`: `#{key, alg, kid, jku}`; see [Card signing](card-signing.md).
 - `supported_versions` (default `[<<"1.0">>]`), `accept_legacy_version` (accept a missing `A2A-Version`, default `false`).
 - `accept_client_context_id` (default `true`), `dedupe_messages` (default `false`; when true a repeated `messageId` returns the existing task).
-- `blocking_timeout` ms (default 30000): how long a blocking `SendMessage` waits before answering with the current snapshot.
+- `blocking_timeout` ms (default 30000) or `infinity`: how long a
+  blocking `SendMessage` waits for a terminal or interrupted state
+  before answering with the current snapshot. `infinity` is what the
+  specification asks for literally, at the cost of a request that never
+  returns on its own.
 - `task_ttl` ms (default 3600000): how long finished task snapshots stay readable.
 - `task_store`: `{Module, Opts}` implementing `barrel_a2a_task_store`. Default `{barrel_a2a_task_store_ets, #{}}` (in memory). `{barrel_a2a_task_store_dets, #{file => "tasks.dets"}}` keeps tasks across restarts; see below.
 - `history_default`: `all` or an integer applied when a request has no `historyLength`.

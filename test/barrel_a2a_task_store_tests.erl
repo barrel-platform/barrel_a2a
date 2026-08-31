@@ -115,3 +115,23 @@ server_survives_restart_test() ->
     ?assertEqual(<<"hello">>, barrel_a2a_artifact:text(hd(barrel_a2a_task:artifacts(Again)))),
     ok = barrel_a2a_server:stop(S2),
     file:delete(File).
+
+%% A store backed by a process reports it, so the server can link and
+%% watch it. One that is just data reports nothing.
+owner_test() ->
+    File = dets_file(),
+    {ok, Dets} = barrel_a2a_task_registry:new({barrel_a2a_task_store_dets, #{file => File}}),
+    Writer = barrel_a2a_task_registry:owner(Dets),
+    ?assert(is_pid(Writer)),
+    ?assert(is_process_alive(Writer)),
+    ok = barrel_a2a_task_registry:close(Dets),
+    _ = file:delete(File),
+    Ets = barrel_a2a_task_registry:new(),
+    ?assertEqual(undefined, barrel_a2a_task_registry:owner(Ets)),
+    ok = barrel_a2a_task_registry:close(Ets).
+
+%% A store that does not export owner/1 at all is taken to have none,
+%% so an out-of-tree store written before the callback existed keeps
+%% working.
+owner_defaults_to_undefined_test() ->
+    ?assertEqual(undefined, barrel_a2a_task_store:owner({lists, some_state})).

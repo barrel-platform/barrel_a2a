@@ -369,3 +369,40 @@ collect_body(Id, Acc) ->
         {h1_stream, Id, {trailers, _}} -> Acc
     after 5000 -> Acc
     end.
+
+%% An event carrying a distinguishable marker, so a test can tell which
+%% ones survived a bounded queue.
+tagged_event(Tag) ->
+    barrel_a2a_event:status_update(?TASK, <<"ctx">>, #{
+        <<"state">> => <<"TASK_STATE_WORKING">>, <<"timestamp">> => Tag
+    }).
+
+tag_of(Event) ->
+    #{<<"statusUpdate">> := #{<<"status">> := #{<<"timestamp">> := Tag}}} = Event,
+    Tag.
+
+%% A webhook slow enough to back up loses the oldest events, not the
+%% newest, and a drop is not a delivery failure: the worker survives and
+%% keeps its configuration.
+full_queue_drops_oldest_test() ->
+    Store = barrel_a2a_push:new_store(),
+    Opts = (worker_opts(script([{error, econnrefused}, {ok, 204}])))#{
+        max_queue => 2, backoff => {300, 2}, max_backoff => 300
+    },
+    {ok, C} = barrel_a2a_push:create(Store, ?TASK, config(), Opts),
+    {ok, Pid} = barrel_a2a_push_delivery:start_link(C, Opts, Store),
+    %% The first delivery fails, so the worker is in backoff holding it.
+    barrel_a2a_push_delivery:deliver(Pid, tagged_event(<<"e1">>)),
+    ?assertEqual(<<"e1">>, tag_of(element(4, wait_posted()))),
+    %% These pile up behind it and push the queue past max_queue.
+    [barrel_a2a_push_delivery:deliver(Pid, tagged_event(T)) || T <- [<<"e2">>, <<"e3">>, <<"e4">>]],
+    %% Backoff expires: what comes out is the newest two, in order.
+    ?assertEqual(<<"e3">>, tag_of(element(4, wait_posted()))),
+    ?assertEqual(<<"e4">>, tag_of(element(4, wait_posted()))),
+    ?assert(is_process_alive(Pid)),
+    %% max_failures is 3 and only one real failure happened, so the
+    %% configuration is still registered.
+    ?assertMatch({ok, _}, barrel_a2a_push:get(Store, ?TASK, maps:get(<<"id">>, C))),
+    Mon = monitor(process, Pid),
+    barrel_a2a_push_delivery:stop(Pid),
+    ?assertEqual(normal, wait_down(Pid, Mon)).

@@ -23,7 +23,8 @@ json_test_() ->
         ?_assertEqual(<<"{\"a\":1}">>, barrel_a2a_json:encode(#{<<"a">> => 1})),
         ?_assertEqual(<<"[1,\"x\",null,true]">>, barrel_a2a_json:encode([1, <<"x">>, null, true])),
         ?_assertEqual({ok, #{<<"a">> => [1, 2]}}, barrel_a2a_json:decode(<<"{\"a\":[1,2]}">>)),
-        ?_assertEqual({ok, #{<<"a">> => 1}}, barrel_a2a_json:decode(<<"{\"a\":1,\"a\":2}">>)),
+        %% ProtoJSON: a repeated key keeps the last occurrence
+        ?_assertEqual({ok, #{<<"a">> => 2}}, barrel_a2a_json:decode(<<"{\"a\":1,\"a\":2}">>)),
         ?_assertEqual({ok, #{}}, barrel_a2a_json:decode(<<"{} \n">>)),
         ?_assertEqual({error, parse_error}, barrel_a2a_json:decode(<<"{} x">>)),
         ?_assertEqual({error, parse_error}, barrel_a2a_json:decode(<<"{\"a\":">>)),

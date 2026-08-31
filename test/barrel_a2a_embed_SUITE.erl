@@ -25,7 +25,11 @@ all() ->
         disconnect_ends_stream,
         embedder_listener_end_to_end,
         core_call_every_operation,
-        two_servers_coexist
+        two_servers_coexist,
+        failed_start_leaves_nothing_behind,
+        bad_options_are_refused,
+        losing_the_task_supervisor_stops_the_server,
+        losing_the_task_store_writer_stops_the_server
     ].
 
 init_per_suite(Config) ->
@@ -393,7 +397,10 @@ core_call_every_operation(Config) ->
         binding => grpc,
         headers => [{<<"a2a-version">>, <<"1.0">>}],
         version => <<"1.0">>,
-        extensions => []
+        extensions => [],
+        %% What a gRPC binding supplies after authenticating the peer.
+        %% The extended agent card is refused without it.
+        principal => <<"embedder">>
     },
     Call = fun(Op, Req) -> barrel_a2a_server_core:call(Server, Op, Req, Ctx) end,
     {ok, #{<<"task">> := T}} = Call(send_message, #{
@@ -468,3 +475,79 @@ two_servers_coexist(Config) ->
     after
         barrel_a2a_server:stop(Other)
     end.
+
+%% `init/1' returning `{stop, _}' never runs `terminate/2', so the
+%% config it published and the listener it opened have to be undone by
+%% hand. A signing key the card cannot use fails after the listener is
+%% up, which is the case that used to leak both.
+failed_start_leaves_nothing_behind(_Config) ->
+    Listeners = fun() -> length(supervisor:which_children(barrel_a2a_listener_sup)) end,
+    Configs = fun() -> length([K || {{barrel_a2a_server, _} = K, _} <- persistent_term:get()]) end,
+    {L0, C0} = {Listeners(), Configs()},
+    %% A signing key the card cannot use fails in `finalize_card/1',
+    %% after `maybe_listen/1' has already opened a port.
+    ?assertMatch(
+        {error, _},
+        barrel_a2a_server:start(barrel_a2a_test_agent:card(), #{
+            handler => barrel_a2a_test_agent,
+            http => #{port => 0},
+            signing => #{key => not_a_key, alg => 'ES256'}
+        })
+    ),
+    %% the instance supervisor needs a moment to give up on its child
+    timer:sleep(300),
+    ?assertEqual(C0, Configs()),
+    ?assertEqual(L0, Listeners()).
+
+bad_options_are_refused(_Config) ->
+    Start = fun(Extra) ->
+        barrel_a2a_server:start(
+            barrel_a2a_test_agent:card(),
+            maps:merge(#{handler => barrel_a2a_test_agent, listen => false}, Extra)
+        )
+    end,
+    ?assertMatch(
+        {error, {invalid_option, {blocking_timeout, 0}}}, Start(#{blocking_timeout => 0})
+    ),
+    ?assertMatch(
+        {error, {invalid_option, {validate_schema, 'maybe'}}}, Start(#{validate_schema => 'maybe'})
+    ),
+    {ok, S} = Start(#{blocking_timeout => infinity, validate_schema => strict}),
+    ?assertEqual(infinity, maps:get(blocking_timeout, barrel_a2a_server:config(S))),
+    barrel_a2a_server:stop(S).
+
+%% The task and push supervisors are linked, not supervised. Losing one
+%% must take the server down rather than leave it holding a dead pid.
+losing_the_task_supervisor_stops_the_server(Config) ->
+    Server = ?config(server, Config),
+    TaskSup = maps:get(task_sup, barrel_a2a_server:config(Server)),
+    Ref = monitor(process, Server),
+    exit(TaskSup, kill),
+    receive
+        {'DOWN', Ref, process, Server, _} -> ok
+    after 5000 -> ct:fail(server_survived_dead_task_sup)
+    end.
+
+%% Same rule for a store backed by a process: the DETS writer owns the
+%% ETS working copy, so its death takes the data with it and the server
+%% must not carry on reading a destroyed table.
+losing_the_task_store_writer_stops_the_server(_Config) ->
+    File = filename:join(
+        os:getenv("TMPDIR", "/tmp"),
+        "barrel_a2a_embed_" ++ integer_to_list(erlang:unique_integer([positive])) ++ ".dets"
+    ),
+    {ok, Server} = barrel_a2a_server:start(barrel_a2a_test_agent:card(), #{
+        handler => barrel_a2a_test_agent,
+        listen => false,
+        task_store => {barrel_a2a_task_store_dets, #{file => File}}
+    }),
+    Writer = maps:get(store_owner, barrel_a2a_server:config(Server)),
+    ?assert(is_pid(Writer)),
+    Ref = monitor(process, Server),
+    exit(Writer, kill),
+    receive
+        {'DOWN', Ref, process, Server, _} -> ok
+    after 5000 -> ct:fail(server_survived_dead_store_writer)
+    end,
+    _ = file:delete(File),
+    ok.

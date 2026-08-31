@@ -34,7 +34,10 @@
 %%% - `auth': see `barrel_a2a_auth'. `authorize': `owner' (default,
 %%%   tasks are visible to the principal that created them), `any',
 %%%   or `fun((Principal, TaskEntry) -> boolean())'.
-%%% - `validate_schema': `inbound' (default), `all' or `false'.
+%%% - `validate_schema': `inbound' (default, checks requests and
+%%%   ignores fields the schema does not declare), `strict' (as
+%%%   `inbound', but an undeclared field is rejected), `all' (`inbound'
+%%%   plus every reply) or `false'.
 %%% - `push_notifications': `false' (default) or the options of
 %%%   `barrel_a2a_push'. Enables the capability.
 %%% - `streaming': capability flag, default `true'.
@@ -50,8 +53,16 @@
 %%% - `task_store': `{Module, Opts}' implementing `barrel_a2a_task_store'
 %%%   (default in-memory ETS; `{barrel_a2a_task_store_dets, #{file =>
 %%%   Path}}' persists tasks across restarts).
-%%% - `blocking_timeout' ms (default 30000), `task_ttl' ms (default
-%%%   3600000), `history_default' (`all' or an integer).
+%%% - `blocking_timeout': how long a blocking SendMessage waits for a
+%%%   terminal or interrupted state before answering with the task as
+%%%   it stands. Milliseconds (default 30000) or `infinity' to wait as
+%%%   long as the specification asks; `infinity' ties up the request
+%%%   process, so use it only where the transport tolerates that.
+%%% - `task_ttl' ms (default 3600000), `history_default' (`all' or an
+%%%   integer).
+%%% - `max_task_queue' (default 100): how many follow-up messages may
+%%%   wait while a handler runs on one task. Past it a send answers
+%%%   `rate_limited' rather than queueing without limit.
 %%% - `hsts' (default `true' when TLS), `rate_limit' hook
 %%%   `fun((ReqCtx) -> ok | {error, RetryAfterSeconds})'.
 %%% @end
@@ -89,6 +100,9 @@
     %% The two stores. `registry' is a `barrel_a2a_task_store' handle,
     %% `push_store' an ETS table; both are owned by the server process.
     registry := barrel_a2a_task_registry:table(),
+    %% The process the store depends on, when it has one (the DETS
+    %% store's writer). Linked, so its death stops the server.
+    store_owner := pid() | undefined,
     push_store := barrel_a2a_push:store(),
     %% Application behaviour.
     handler := barrel_a2a_handler:handler(),
@@ -96,7 +110,7 @@
     authorize := owner | any | fun((barrel_a2a:principal(), map()) -> boolean()),
     rate_limit := undefined | fun((map()) -> ok | {error, non_neg_integer()}),
     %% Protocol policy.
-    validate_schema := inbound | all | false,
+    validate_schema := inbound | strict | all | false,
     streaming := boolean(),
     push := false | barrel_a2a_push:opts(),
     extended_card :=
@@ -111,6 +125,8 @@
     %% Task behaviour.
     blocking_timeout := timeout(),
     task_ttl := non_neg_integer(),
+    %% How many follow-up messages may wait while a handler runs.
+    max_task_queue := pos_integer(),
     history_default := all | non_neg_integer(),
     %% Where the bindings are mounted. `engine' is the subset handed to
     %% `barrel_a2a_http_engine:config/2'.
@@ -235,18 +251,50 @@ init({InstSup, #{card := Card0, opts := Opts}}) ->
     try
         Cfg0 = build_config(InstSup, Card0, Opts),
         persistent_term:put({?MODULE, self()}, Cfg0),
+        %% Stored again before the card is finalized so that a failure
+        %% in `finalize_card/1' can still find the listener to stop.
         Cfg1 = maybe_listen(Cfg0),
+        persistent_term:put({?MODULE, self()}, Cfg1),
         Cfg = finalize_card(Cfg1),
         persistent_term:put({?MODULE, self()}, Cfg),
-        Ttl = maps:get(task_ttl, Cfg),
-        TRef = erlang:send_after(min(Ttl, 60000), self(), expire),
-        {ok, #{cfg => Cfg, timer => TRef}}
+        {ok, #{cfg => Cfg, timer => arm_expiry(Cfg)}}
     catch
         throw:{invalid_option, _} = Reason ->
-            {stop, Reason};
+            {stop, undo(Reason)};
         throw:{listener, Reason} ->
-            {stop, {listener_failed, Reason}}
+            {stop, undo({listener_failed, Reason})};
+        Class:Reason:Stack ->
+            %% Anything else is a bug rather than a rejected option, but
+            %% it must not leak what was already built either.
+            _ = undo(Reason),
+            erlang:raise(Class, Reason, Stack)
     end.
+
+%% Returning `{stop, _}' from `init/1' does not run `terminate/2', so
+%% everything built so far has to be undone here. The partial config is
+%% read back from `persistent_term' because the throw discarded it.
+undo(Reason) ->
+    case persistent_term:get({?MODULE, self()}, undefined) of
+        undefined ->
+            ok;
+        Cfg ->
+            _ =
+                case maps:get(listener_id, Cfg, undefined) of
+                    undefined -> ok;
+                    Id -> barrel_a2a_listener_sup:stop_listener(Id)
+                end,
+            _ = barrel_a2a_task_registry:close(maps:get(registry, Cfg)),
+            _ = persistent_term:erase({?MODULE, self()}),
+            ok
+    end,
+    Reason.
+
+%% The expiry sweep runs at most once a minute and at least once a
+%% second: `task_ttl' can legitimately be 0 (expire as soon as a task is
+%% terminal), and `send_after(0, ...)' would spin.
+arm_expiry(Cfg) ->
+    Ttl = maps:get(task_ttl, Cfg),
+    erlang:send_after(max(1000, min(Ttl, 60000)), self(), expire).
 
 %% @private
 handle_call(inst_sup, _From, #{cfg := Cfg} = St) ->
@@ -270,8 +318,22 @@ handle_cast(_Msg, St) ->
 %% @private
 handle_info(expire, #{cfg := Cfg} = St) ->
     _ = barrel_a2a_task_registry:expire(maps:get(registry, Cfg), maps:get(task_ttl, Cfg)),
-    TRef = erlang:send_after(min(maps:get(task_ttl, Cfg), 60000), self(), expire),
-    {noreply, St#{timer => TRef}};
+    {noreply, St#{timer => arm_expiry(Cfg)}};
+handle_info({'EXIT', Pid, Reason}, #{cfg := Cfg} = St) ->
+    %% The task and push supervisors, and a process-backed task store,
+    %% are linked but not supervised (see barrel_a2a_server_inst_sup).
+    %% Losing one leaves this process holding a dead pid, and for the
+    %% store its data as well, so stop and let the instance supervisor
+    %% rebuild the whole server.
+    Linked = [
+        maps:get(task_sup, Cfg),
+        maps:get(push_sup, Cfg),
+        maps:get(store_owner, Cfg)
+    ],
+    case lists:member(Pid, Linked) of
+        true -> {stop, {linked_process_down, Pid, Reason}, St};
+        false -> {noreply, St}
+    end;
 handle_info(_Other, St) ->
     {noreply, St}.
 
@@ -311,6 +373,8 @@ build_config(InstSup, Card0, Opts) ->
             {error, Reason} -> throw({invalid_option, {task_store, Reason}})
         end,
     PushStore = barrel_a2a_push:new_store(),
+    %% `undefined' for a store that is just data, such as the ETS one.
+    StoreOwner = barrel_a2a_task_registry:owner(Registry),
     Base = base_path(maps:get(base_path, Opts, ?DEFAULT_BASE)),
     Cfg = #{
         server => self(),
@@ -319,6 +383,7 @@ build_config(InstSup, Card0, Opts) ->
         task_sup => TaskSup,
         push_sup => PushSup,
         registry => Registry,
+        store_owner => StoreOwner,
         push_store => PushStore,
         card_base => Card,
         handler => Handler,
@@ -333,8 +398,9 @@ build_config(InstSup, Card0, Opts) ->
         accept_legacy_version => maps:get(accept_legacy_version, Opts, false) =:= true,
         accept_client_context_id => maps:get(accept_client_context_id, Opts, true) =:= true,
         dedupe_messages => maps:get(dedupe_messages, Opts, false) =:= true,
-        blocking_timeout => maps:get(blocking_timeout, Opts, 30000),
+        blocking_timeout => blocking_opt(maps:get(blocking_timeout, Opts, 30000)),
         task_ttl => maps:get(task_ttl, Opts, 3600000),
+        max_task_queue => pos_int_opt(max_task_queue, maps:get(max_task_queue, Opts, 100)),
         history_default => maps:get(history_default, Opts, all),
         rate_limit => maps:get(rate_limit, Opts, undefined),
         tenant => maps:get(tenant, Opts, undefined),
@@ -367,10 +433,18 @@ task_store_opt(Mod) when is_atom(Mod) -> {Mod, #{}};
 task_store_opt(Other) -> throw({invalid_option, {task_store, Other}}).
 
 schema_opt(inbound) -> inbound;
+schema_opt(strict) -> strict;
 schema_opt(all) -> all;
 schema_opt(false) -> false;
 schema_opt(true) -> inbound;
 schema_opt(Other) -> throw({invalid_option, {validate_schema, Other}}).
+
+pos_int_opt(_, N) when is_integer(N), N > 0 -> N;
+pos_int_opt(Key, Other) -> throw({invalid_option, {Key, Other}}).
+
+blocking_opt(infinity) -> infinity;
+blocking_opt(Ms) when is_integer(Ms), Ms > 0 -> Ms;
+blocking_opt(Other) -> throw({invalid_option, {blocking_timeout, Other}}).
 
 push_opt(false, _) ->
     false;

@@ -46,6 +46,7 @@
 -define(DEFAULT_TIMEOUT, 30000).
 -define(SSE, <<"text/event-stream">>).
 -define(JSON, <<"application/json">>).
+-define(MAX_BODY, 16 * 1024 * 1024).
 
 -type conn() :: #{
     url := binary(),
@@ -242,8 +243,14 @@ chunk(Chunk, #st{sse = true, parser = P} = St) ->
             emit(St#st.owner, {error, barrel_a2a_error:transport(Reason)}),
             stop
     end;
-chunk(Chunk, #st{buffer = Buf} = St) ->
-    {continue, St#st{buffer = <<Buf/binary, Chunk/binary>>}}.
+chunk(Chunk, #st{buffer = Buf} = St) when byte_size(Buf) + byte_size(Chunk) =< ?MAX_BODY ->
+    {continue, St#st{buffer = <<Buf/binary, Chunk/binary>>}};
+%% A stream request answered with a single document, not an event
+%% stream: the whole body is collected before it can be decoded, so it
+%% needs a ceiling. An SSE response never lands here.
+chunk(_Chunk, #st{owner = Owner}) ->
+    emit(Owner, {error, barrel_a2a_error:transport(body_too_large)}),
+    stop.
 
 %% Stream ended: flush the parser (SSE) or interpret the collected
 %% body (an error status, or a direct JSON reply).

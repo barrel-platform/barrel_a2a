@@ -3,8 +3,8 @@
 %%%
 %%% Decoding is bounded: a document nested deeper than
 %%% `max_json_depth' (default 64) is refused before the stack grows,
-%%% and trailing bytes after the value are an error. Duplicate keys
-%%% keep the first occurrence, as the default decoder does.
+%%% and trailing bytes after the value are an error. A duplicate key
+%%% keeps the last occurrence, as ProtoJSON requires.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_json).
@@ -44,8 +44,9 @@ trailing(Term, Trailing) ->
     end.
 
 %% Every container start bumps the depth, every finish drops it. The
-%% object accumulator is left unreversed so `maps:from_list/1' keeps
-%% the first duplicate key, matching the default decoder.
+%% object accumulator is built head-first and reversed at the end, so
+%% `maps:from_list/1' keeps the last occurrence of a duplicate key.
+%% ProtoJSON requires that; the default OTP decoder keeps the first.
 depth_counting_decoders(Depth, Max) ->
     Enter = fun() ->
         counters:add(Depth, 1, 1),
@@ -63,7 +64,7 @@ depth_counting_decoders(Depth, Max) ->
         object_push => fun(Key, Value, Acc) -> [{Key, Value} | Acc] end,
         object_finish => fun(Acc, OldAcc) ->
             Leave(),
-            {maps:from_list(Acc), OldAcc}
+            {maps:from_list(lists:reverse(Acc)), OldAcc}
         end,
         array_start => fun(_) ->
             Enter(),

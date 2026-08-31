@@ -15,7 +15,9 @@
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_task_registry).
 
--export([new/0, new/1, close/1, insert/2, update/2, delete/2, lookup/2, list/2, expire/2, all/1]).
+-export([
+    new/0, new/1, close/1, owner/1, insert/2, update/2, delete/2, lookup/2, list/2, expire/2, all/1
+]).
 
 -record(row, {
     id :: binary(),
@@ -41,14 +43,21 @@
     context_id => binary(),
     state => barrel_a2a:state(),
     after_ms => integer(),
+    %% An extra predicate on the entry, for an authorization rule the
+    %% other keys cannot express. It runs with them, before the total
+    %% is counted and the page is cut, so `totalSize' and
+    %% `nextPageToken' describe only rows the caller may see.
+    visible => fun((entry()) -> boolean()),
     page_size => pos_integer(),
     page_token => binary() | undefined
 }.
 
 -export_type([table/0, entry/0, filter/0]).
 
+%% Both fixed by the specification: "If unspecified, at most 50 tasks
+%% will be returned. The minimum value is 1. The maximum value is 100."
 -define(DEFAULT_PAGE, 50).
--define(MAX_PAGE, 1000).
+-define(MAX_PAGE, 100).
 
 -spec new() -> table().
 new() ->
@@ -86,6 +95,11 @@ repair(Store, Map) ->
 
 -spec close(table()) -> ok.
 close(Store) -> barrel_a2a_task_store:close(Store).
+
+%% @doc The process the store depends on, or `undefined'. The server
+%% links it and stops when it dies; see the store behaviour.
+-spec owner(table()) -> pid() | undefined.
+owner(Store) -> barrel_a2a_task_store:owner(Store).
 
 -spec insert(table(), entry()) -> ok.
 insert(Tab, Entry) ->
@@ -162,7 +176,11 @@ matches(Row, Filter) ->
     owner_ok(Row, maps:get(owner, Filter, any)) andalso
         context_ok(Row, maps:get(context_id, Filter, undefined)) andalso
         state_ok(Row, maps:get(state, Filter, undefined)) andalso
-        after_ok(Row, maps:get(after_ms, Filter, undefined)).
+        after_ok(Row, maps:get(after_ms, Filter, undefined)) andalso
+        visible_ok(Row, maps:get(visible, Filter, undefined)).
+
+visible_ok(_, undefined) -> true;
+visible_ok(Row, Fun) -> Fun(from_row(Row)) =:= true.
 
 owner_ok(_, any) -> true;
 owner_ok(#row{owner = O}, Owner) -> O =:= Owner.
@@ -173,8 +191,10 @@ context_ok(#row{context_id = C}, Ctx) -> C =:= Ctx.
 state_ok(_, undefined) -> true;
 state_ok(#row{state = S}, State) -> S =:= State.
 
+%% The specification says "greater than or equal to" (a2a.proto,
+%% status_timestamp_after), so the bound is inclusive.
 after_ok(_, undefined) -> true;
-after_ok(#row{status_ms = Ms}, After) -> Ms > After.
+after_ok(#row{status_ms = Ms}, After) -> Ms >= After.
 
 newer(#row{status_ms = A, id = IdA}, #row{status_ms = B, id = IdB}) ->
     {A, IdA} > {B, IdB}.

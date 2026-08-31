@@ -29,7 +29,7 @@
 -behaviour(barrel_a2a_task_store).
 -behaviour(gen_server).
 
--export([open/1, put/2, get/2, delete/2, all/1, close/1, flush/1]).
+-export([open/1, put/2, get/2, delete/2, all/1, close/1, owner/1, flush/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(FLUSH_INTERVAL, 1000).
@@ -81,6 +81,12 @@ delete({Ets, Writer, Sync}, Id) ->
 all({Ets, _, _}) ->
     [Row || {_, Row} <- ets:tab2list(Ets)].
 
+%% The working copy lives in an ETS table the writer creates in its own
+%% `init/1', so the writer's death destroys the data. The server links
+%% it and stops when it goes.
+owner({_, Writer, _}) ->
+    Writer.
+
 close({_, Writer, _}) ->
     try
         gen_server:stop(Writer)
@@ -106,7 +112,10 @@ mark(Writer, Id, Op, false) ->
 %% @private
 init(#{file := File} = Opts) ->
     process_flag(trap_exit, true),
-    Name = list_to_atom("barrel_a2a_tasks_" ++ filename:absname(File)),
+    %% A dets table name is any term, so the absolute path is used
+    %% directly. Deriving an atom from it would leak one per distinct
+    %% file, and atoms are never collected.
+    Name = {?MODULE, filename:absname(File)},
     case dets:open_file(Name, [{file, File}, {type, set}]) of
         {ok, Dets} ->
             Ets = ets:new(barrel_a2a_tasks, [set, public, {read_concurrency, true}]),

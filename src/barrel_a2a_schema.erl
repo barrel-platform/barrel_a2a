@@ -9,11 +9,13 @@
 %%% Nothing is read at application start. The first call to any
 %%% function here loads the bundle into `persistent_term'; each type
 %%% is compiled on first use and cached under
-%%% `{barrel_a2a_schema, Type}'.
+%%% `{barrel_a2a_schema, Type, Mode}'.
 %%%
 %%% {@link validate/2} checks a decoded JSON value against
 %%% `#/$defs/Type'. The bundle has no `required' lists, so a missing
 %%% field passes; a wrongly typed or unknown field does not.
+%%% {@link validate/3} takes the same check with `lenient', which
+%%% tolerates a field the bundle does not declare.
 %%%
 %%% {@link request_type/1} and {@link reply_type/1} map an operation to
 %%% the `$defs' name each side validates against. They live here, next
@@ -23,7 +25,7 @@
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_schema).
 
--export([load/0, types/0, validate/2, schema/0, version/0]).
+-export([load/0, types/0, validate/2, validate/3, schema/0, version/0]).
 -export([request_type/1, reply_type/1]).
 
 -define(BUNDLE_KEY, {?MODULE, bundle}).
@@ -51,10 +53,29 @@ schema() ->
 version() ->
     maps:get(<<"version">>, bundle()).
 
-%% @doc Validate `Value' against `#/$defs/Type'.
+%% @doc Validate `Value' against `#/$defs/Type', rejecting fields the
+%% bundle does not declare.
 -spec validate(binary(), term()) -> ok | {error, [barrel_a2a_jsonschema:error()]}.
-validate(Type, Value) when is_binary(Type) ->
-    case compiled(Type) of
+validate(Type, Value) ->
+    validate(Type, Value, strict).
+
+%% @doc Validate `Value' against `#/$defs/Type'.
+%%
+%% `strict' uses the bundle as written, so an undeclared field is an
+%% error. `lenient' drops every `additionalProperties: false' first, so
+%% a field this version does not know about passes: that is what A2A
+%% asks of a server reading a request written against a later minor
+%% version (5.7), and it is the mode the server uses by default.
+%% Everything else is checked identically.
+-spec validate(binary(), term(), strict | lenient) ->
+    ok | {error, [barrel_a2a_jsonschema:error()]}.
+validate(Type, Value, strict) when is_binary(Type) ->
+    do_validate(Type, Value, strict);
+validate(Type, Value, lenient) when is_binary(Type) ->
+    do_validate(Type, Value, lenient).
+
+do_validate(Type, Value, Mode) ->
+    case compiled(Type, Mode) of
         {ok, Compiled} -> barrel_a2a_jsonschema:validate(Value, Compiled, #{});
         {error, Reason} -> {error, [{[], Reason}]}
     end.
@@ -138,11 +159,11 @@ check_and_store(Bundle) ->
             {error, {invalid_bundle, Reason}}
     end.
 
-compiled(Type) ->
-    Key = {?MODULE, Type},
+compiled(Type, Mode) ->
+    Key = {?MODULE, Type, Mode},
     case persistent_term:get(Key, undefined) of
         undefined ->
-            case compile_type(Type) of
+            case compile_type(Type, Mode) of
                 {ok, Compiled} ->
                     persistent_term:put(Key, Compiled),
                     {ok, Compiled};
@@ -155,7 +176,7 @@ compiled(Type) ->
 
 %% A document whose root is one definition, with every other
 %% definition still reachable by `$ref'.
-compile_type(Type) ->
+compile_type(Type, Mode) ->
     Bundle = bundle(),
     Defs = defs(Bundle),
     case maps:is_key(Type, Defs) of
@@ -164,8 +185,25 @@ compile_type(Type) ->
         true ->
             Doc = #{
                 <<"$schema">> => maps:get(<<"$schema">>, Bundle),
-                <<"$defs">> => Defs,
+                <<"$defs">> => relax(Mode, Defs),
                 <<"$ref">> => <<"#/$defs/", Type/binary>>
             },
             barrel_a2a_jsonschema:compile(Doc)
     end.
+
+%% Drop `additionalProperties: false' wherever it appears. Only the
+%% literal `false' goes: the bundle also uses `additionalProperties'
+%% with a subschema, to type the values of an open map, and that is a
+%% constraint worth keeping. The bundle declares no property actually
+%% named `additionalProperties', so no property schema is harmed.
+relax(strict, Node) ->
+    Node;
+relax(lenient, Node) when is_map(Node) ->
+    maps:from_list([
+        {K, relax(lenient, V)}
+     || {K, V} <- maps:to_list(Node), not (K =:= <<"additionalProperties">> andalso V =:= false)
+    ]);
+relax(lenient, Node) when is_list(Node) ->
+    [relax(lenient, N) || N <- Node];
+relax(lenient, Node) ->
+    Node.

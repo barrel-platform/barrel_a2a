@@ -80,6 +80,21 @@ table when it writes its final row.
 The fan-out to webhooks happens on the task process, so a slow push
 hook stalls task progress and every open stream for that task.
 
+**T11. Every queue a peer can fill has a bound and a stated policy.**
+Three accumulators grow at a rate the local node does not control, and
+each answers it differently, on purpose. The follow-up queue in
+`barrel_a2a_task_proc` refuses past `max_task_queue` with
+`rate_limited`, because silently dropping a client's message would
+have it believe the message was accepted. The delivery queue in
+`barrel_a2a_push_delivery` drops its oldest past `max_queue`, because
+push is at-least-once best effort and the newest state is what a
+receiver needs; a deliberate drop must not count toward
+`max_failures`. The replay queue in `barrel_a2a_remote_task` drops its
+oldest, because the task snapshot is folded from every event anyway,
+so the outcome survives. Task history is deliberately not bounded:
+it is protocol data, and the reference `a2a-sdk` also stores it whole
+and truncates only on read.
+
 ## Engine and transport
 
 **E1. The engine owns the mailbox of the process that calls it.**
@@ -137,7 +152,21 @@ no process hop, and erased in `terminate/2`. Reads that can happen
 after a server stops go through the guarded helper in the engine.
 
 **F2. Building the config reads it back.** The `init/1` of
-`barrel_a2a_server` writes a partial config, starts the listener (whose handler builds an
-engine config by reading the term), then writes the complete one. The
-double write is deliberate; do not collapse it without breaking that
-cycle another way.
+`barrel_a2a_server` writes a partial config, starts the listener (whose
+handler builds an engine config by reading the term), then writes the
+complete one. The write is repeated at each step deliberately; do not
+collapse it without breaking that cycle another way.
+
+**F3. A failed `init/1` has to clean up after itself.** Returning
+`{stop, _}` from `init/1`, or crashing in it, does not run
+`terminate/2`. `undo/1` erases the `persistent_term` entry, closes the
+registry and stops a listener that already started. It reads the
+partial config back from `persistent_term`, which is why F2's repeated
+write matters for more than the listener.
+
+**F4. The task and push supervisors are linked, not supervised.** The
+server starts them from its own `init/1` (see
+`barrel_a2a_server_inst_sup` for why). It therefore traps exits and
+turns the death of either into its own `{stop, _}`, so the instance
+supervisor rebuilds the whole server rather than leaving one holding a
+dead pid.
