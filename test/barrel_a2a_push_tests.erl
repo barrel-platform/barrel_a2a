@@ -381,28 +381,28 @@ tag_of(Event) ->
     #{<<"statusUpdate">> := #{<<"status">> := #{<<"timestamp">> := Tag}}} = Event,
     Tag.
 
-%% A webhook slow enough to back up loses the oldest events, not the
-%% newest, and a drop is not a delivery failure: the worker survives and
-%% keeps its configuration.
-full_queue_drops_oldest_test() ->
+%% Delivery is at-least-once, so a full queue is never emptied by
+%% discarding events. It counts as a delivery failure instead, and a
+%% receiver that never keeps up loses its configuration, which is what
+%% 4.3 allows.
+full_queue_counts_as_a_failure_test() ->
     Store = barrel_a2a_push:new_store(),
     Opts = (worker_opts(script([{error, econnrefused}, {ok, 204}])))#{
-        max_queue => 2, backoff => {300, 2}, max_backoff => 300
+        max_queue => 1, max_failures => 3, backoff => {5000, 2}, max_backoff => 5000
     },
     {ok, C} = barrel_a2a_push:create(Store, ?TASK, config(), Opts),
+    Id = maps:get(<<"id">>, C),
     {ok, Pid} = barrel_a2a_push_delivery:start_link(C, Opts, Store),
-    %% The first delivery fails, so the worker is in backoff holding it.
+    Mon = monitor(process, Pid),
+    %% The first delivery fails (failure 1) and the worker backs off
+    %% holding that event, so the queue is at max_queue.
     barrel_a2a_push_delivery:deliver(Pid, tagged_event(<<"e1">>)),
     ?assertEqual(<<"e1">>, tag_of(element(4, wait_posted()))),
-    %% These pile up behind it and push the queue past max_queue.
-    [barrel_a2a_push_delivery:deliver(Pid, tagged_event(T)) || T <- [<<"e2">>, <<"e3">>, <<"e4">>]],
-    %% Backoff expires: what comes out is the newest two, in order.
-    ?assertEqual(<<"e3">>, tag_of(element(4, wait_posted()))),
-    ?assertEqual(<<"e4">>, tag_of(element(4, wait_posted()))),
-    ?assert(is_process_alive(Pid)),
-    %% max_failures is 3 and only one real failure happened, so the
-    %% configuration is still registered.
-    ?assertMatch({ok, _}, barrel_a2a_push:get(Store, ?TASK, maps:get(<<"id">>, C))),
-    Mon = monitor(process, Pid),
-    barrel_a2a_push_delivery:stop(Pid),
-    ?assertEqual(normal, wait_down(Pid, Mon)).
+    %% Each further event finds the queue full: failures 2 and 3, and
+    %% the third reaches max_failures.
+    barrel_a2a_push_delivery:deliver(Pid, tagged_event(<<"e2">>)),
+    barrel_a2a_push_delivery:deliver(Pid, tagged_event(<<"e3">>)),
+    ?assertEqual(normal, wait_down(Pid, Mon)),
+    %% Giving up is visible: the configuration is gone, not silently
+    %% collecting events nobody will ever receive.
+    ?assertEqual(error, barrel_a2a_push:get(Store, ?TASK, Id)).

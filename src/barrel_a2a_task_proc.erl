@@ -61,13 +61,16 @@
 -behaviour(gen_server).
 
 -export([start_link/1, run/1, materialize/1]).
--export([subscribe/2, unsubscribe/2, get_task/1, send_message/3, cancel/2, await/2]).
+-export([subscribe/2, unsubscribe/2, get_task/1, send_message/3, cancel/2, await/2, await/3]).
 -export([ctx_status/3, ctx_artifact/3, ctx_cancelled/1, ctx_resume/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(LINGER_MS, 100).
 -define(CANCEL_GRACE_MS, 5000).
+%% Defaults for a `cfg' built by hand. `barrel_a2a_server_core' always
+%% sets both from the server options.
 -define(DEFAULT_MAX_QUEUE, 100).
+-define(DEFAULT_MAX_SUBSCRIBER_QUEUE, 1000).
 
 -record(st, {
     cfg :: barrel_a2a_server_core:task_cfg(),
@@ -170,26 +173,46 @@ cancel(Pid, Metadata) -> gen_server:call(Pid, {cancel, Metadata}, ?CANCEL_GRACE_
 -spec await(pid(), timeout()) ->
     {task, barrel_a2a:task()} | {message, barrel_a2a:message()} | {error, term()}.
 await(Pid, Timeout) ->
-    Deadline = deadline(Timeout),
-    await_loop(Pid, Deadline).
+    await(Pid, Timeout, fun(_) -> false end).
 
-await_loop(Pid, Deadline) ->
+%% @doc As {@link await/2}, but `Disconnected(Msg)' recognises the
+%% transport's "the peer is gone" message.
+%%
+%% A blocking send waits with no deadline by default, so without this
+%% the request process would sit here for the life of the task even
+%% though nobody is left to read the answer. This runs in the request
+%% process, which owns its mailbox (invariants.md, E1), so consuming
+%% messages that are not ours is safe here and nowhere else.
+-spec await(pid(), timeout(), fun((term()) -> boolean())) ->
+    {task, barrel_a2a:task()} | {message, barrel_a2a:message()} | {error, term()}.
+await(Pid, Timeout, Disconnected) ->
+    Deadline = deadline(Timeout),
+    await_loop(Pid, Deadline, Disconnected).
+
+await_loop(Pid, Deadline, Disc) ->
     receive
         {a2a_task_event, _, #{<<"message">> := M}} ->
             {message, M};
         {a2a_task_event, _, #{<<"task">> := T}} ->
-            settled_or_wait(Pid, Deadline, barrel_a2a_task:state(T));
+            settled_or_wait(Pid, Deadline, Disc, barrel_a2a_task:state(T));
         {a2a_task_event, _, #{<<"statusUpdate">> := #{<<"status">> := #{<<"state">> := S}}}} ->
             case barrel_a2a_task_state:from_wire(S) of
-                {ok, State} -> settled_or_wait(Pid, Deadline, State);
-                error -> await_loop(Pid, Deadline)
+                {ok, State} -> settled_or_wait(Pid, Deadline, Disc, State);
+                error -> await_loop(Pid, Deadline, Disc)
             end;
         {a2a_task_event, _, _} ->
-            await_loop(Pid, Deadline);
+            await_loop(Pid, Deadline, Disc);
         {a2a_task_error, _, Error} ->
             {error, Error};
         {'DOWN', _, process, Pid, _} ->
-            {error, task_process_down}
+            {error, task_process_down};
+        Other ->
+            case Disc(Other) of
+                %% The task keeps running: a disconnect is not a cancel
+                %% (3.1.2), and the client can pick it up with GetTask.
+                true -> {error, disconnected};
+                false -> await_loop(Pid, Deadline, Disc)
+            end
     after remaining(Deadline) ->
         case materialize_safe(Pid) of
             {ok, T} -> {task, T};
@@ -197,7 +220,7 @@ await_loop(Pid, Deadline) ->
         end
     end.
 
-settled_or_wait(Pid, Deadline, State) ->
+settled_or_wait(Pid, Deadline, Disc, State) ->
     case
         barrel_a2a_task_state:is_terminal(State) orelse barrel_a2a_task_state:is_interrupted(State)
     of
@@ -207,7 +230,7 @@ settled_or_wait(Pid, Deadline, State) ->
                 error -> {error, task_process_down}
             end;
         false ->
-            await_loop(Pid, Deadline)
+            await_loop(Pid, Deadline, Disc)
     end.
 
 materialize_safe(Pid) ->
@@ -462,10 +485,18 @@ stop_worker(#st{worker = {Pid, _Ref, Message}} = St) ->
     %% `handle_cancel/1' must never call back into `barrel_a2a_ctx':
     %% the ctx action would sit in a mailbox nobody is reading and time
     %% out (invariants.md, T4).
-    {CPid, CRef} = spawn_monitor(fun() -> barrel_a2a_handler:invoke_cancel(Handler, Ctx) end),
+    %% Linked as well as monitored: if this process is killed while the
+    %% grace period is running, an application `handle_cancel' that
+    %% never returns would otherwise be left running with nothing left
+    %% to reap it.
+    {CPid, CRef} = spawn_opt(
+        fun() -> barrel_a2a_handler:invoke_cancel(Handler, Ctx) end,
+        [link, monitor]
+    ),
     receive
         {'DOWN', CRef, process, CPid, _} -> ok
     after ?CANCEL_GRACE_MS ->
+        unlink(CPid),
         exit(CPid, kill)
     end,
     %% Unlink before kill. The worker is linked, so killing it while
@@ -539,8 +570,8 @@ handle_result(ok, St) ->
         _ -> after_result(St1)
     end;
 handle_result({error, #{type := _} = Err}, #st{materialized = false} = St) ->
-    send_all(St, {a2a_task_error, St#st.task_id, Err}),
-    finish(St#st{done = true});
+    St1 = send_all(St, {a2a_task_error, St#st.task_id, Err}),
+    finish(St1#st{done = true});
 handle_result({error, #{type := _, message := Text}}, St) ->
     fail(St, barrel_a2a_message:agent(Text));
 handle_result({error, Reason}, St) ->
@@ -661,8 +692,8 @@ registry_update(St, Pid) ->
         state => barrel_a2a_task:state(St#st.task)
     }).
 
-publish(St, Event) ->
-    send_all(St, {a2a_task_event, St#st.task_id, Event}),
+publish(St0, Event) ->
+    St = send_all(St0, {a2a_task_event, St0#st.task_id, Event}),
     case maps:get(push_notify, St#st.cfg, undefined) of
         undefined ->
             ok;
@@ -675,5 +706,44 @@ publish(St, Event) ->
     end,
     St.
 
-send_all(#st{subscribers = Subs}, Msg) ->
-    maps:foreach(fun(Pid, _) -> Pid ! Msg end, Subs).
+%% A subscriber that has stopped reading is not the same as one that
+%% disconnected: TCP backpressure blocks its writer while this process
+%% keeps appending, so its mailbox is the thing that grows. Past
+%% `max_subscriber_queue' the subscriber is dropped, told once why, and
+%% sent nothing further. Its process is left alone: an embedder owns it.
+send_all(#st{subscribers = Subs} = St, Msg) ->
+    Max = maps:get(max_subscriber_queue, St#st.cfg, ?DEFAULT_MAX_SUBSCRIBER_QUEUE),
+    Kept = maps:filter(
+        fun(Pid, Ref) ->
+            case backlog(Pid) of
+                Len when Len > Max ->
+                    evict(St, Pid, Ref, Len),
+                    false;
+                _ ->
+                    Pid ! Msg,
+                    true
+            end
+        end,
+        Subs
+    ),
+    St#st{subscribers = Kept}.
+
+%% A dead subscriber reports no backlog; its monitor cleans it up.
+backlog(Pid) ->
+    case process_info(Pid, message_queue_len) of
+        {message_queue_len, Len} -> Len;
+        undefined -> 0
+    end.
+
+evict(St, Pid, Ref, Len) ->
+    logger:warning(
+        "a2a task ~s: dropping subscriber ~p, ~b events unread",
+        [St#st.task_id, Pid, Len]
+    ),
+    _ = erlang:demonitor(Ref, [flush]),
+    %% One termination control message, which both the HTTP engine and
+    %% the client handle understand as "this stream is over".
+    Pid !
+        {a2a_task_error, St#st.task_id,
+            barrel_a2a_error:new(unavailable, <<"Subscriber fell too far behind">>)},
+    ok.

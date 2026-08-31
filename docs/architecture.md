@@ -81,9 +81,12 @@ socket --> barrel_a2a_listener (per request process, h1 or h2)
 ```
 
 A blocking `SendMessage` subscribes the request process to the task,
-starts the handler and waits in `barrel_a2a_task_proc:await/2` until
-the task is terminal or interrupted, a direct message arrives, or
-`blocking_timeout` elapses (then the current snapshot is returned).
+starts the handler and waits in `barrel_a2a_task_proc:await/3` until
+the task is terminal or interrupted, a direct message arrives, the peer
+disconnects, or `blocking_timeout` elapses. The default is `infinity`,
+so the first three are what normally end the wait; a configured
+timeout returns the current snapshot, which is a deliberate deviation
+from the specification.
 
 ## Request flow: streaming call
 

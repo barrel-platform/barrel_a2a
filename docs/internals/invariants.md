@@ -86,10 +86,10 @@ each answers it differently, on purpose. The follow-up queue in
 `barrel_a2a_task_proc` refuses past `max_task_queue` with
 `rate_limited`, because silently dropping a client's message would
 have it believe the message was accepted. The delivery queue in
-`barrel_a2a_push_delivery` drops its oldest past `max_queue`, because
-push is at-least-once best effort and the newest state is what a
-receiver needs; a deliberate drop must not count toward
-`max_failures`. The replay queue in `barrel_a2a_remote_task` drops its
+`barrel_a2a_push_delivery` never discards: reaching `max_queue` counts
+as a delivery failure, because 4.3 promises at-least-once and the only
+honest way to bound memory under that promise is to give up on the
+receiver visibly, which `max_failures` then does. The replay queue in `barrel_a2a_remote_task` drops its
 oldest, because the task snapshot is folded from every event anyway,
 so the outcome survives. Task history is deliberately not bounded:
 it is protocol data, and the reference `a2a-sdk` also stores it whole

@@ -53,16 +53,23 @@
 %%% - `task_store': `{Module, Opts}' implementing `barrel_a2a_task_store'
 %%%   (default in-memory ETS; `{barrel_a2a_task_store_dets, #{file =>
 %%%   Path}}' persists tasks across restarts).
-%%% - `blocking_timeout': how long a blocking SendMessage waits for a
-%%%   terminal or interrupted state before answering with the task as
-%%%   it stands. Milliseconds (default 30000) or `infinity' to wait as
-%%%   long as the specification asks; `infinity' ties up the request
-%%%   process, so use it only where the transport tolerates that.
+%%% - `blocking_timeout': `infinity' (default) waits for a terminal or
+%%%   interrupted state, as the specification requires of a send with
+%%%   `returnImmediately' unset or false. The wait still ends as soon
+%%%   as the peer disconnects, so a vanished client does not pin a
+%%%   request process. Setting a number of milliseconds instead is an
+%%%   operational deviation: past it the call answers with the task as
+%%%   it stands, which is not a final result. Prefer the admission
+%%%   controls (`max_connections', `auth', `rate_limit') for load.
 %%% - `task_ttl' ms (default 3600000), `history_default' (`all' or an
 %%%   integer).
 %%% - `max_task_queue' (default 100): how many follow-up messages may
 %%%   wait while a handler runs on one task. Past it a send answers
 %%%   `rate_limited' rather than queueing without limit.
+%%% - `max_subscriber_queue' (default 1000): how many events a stream
+%%%   subscriber may leave unread before its stream is ended. A client
+%%%   that stops reading without disconnecting cannot otherwise be
+%%%   told apart from a slow one.
 %%% - `hsts' (default `true' when TLS), `rate_limit' hook
 %%%   `fun((ReqCtx) -> ok | {error, RetryAfterSeconds})'.
 %%% @end
@@ -127,6 +134,8 @@
     task_ttl := non_neg_integer(),
     %% How many follow-up messages may wait while a handler runs.
     max_task_queue := pos_integer(),
+    %% How far behind a stream subscriber may fall before it is dropped.
+    max_subscriber_queue := pos_integer(),
     history_default := all | non_neg_integer(),
     %% Where the bindings are mounted. `engine' is the subset handed to
     %% `barrel_a2a_http_engine:config/2'.
@@ -398,9 +407,12 @@ build_config(InstSup, Card0, Opts) ->
         accept_legacy_version => maps:get(accept_legacy_version, Opts, false) =:= true,
         accept_client_context_id => maps:get(accept_client_context_id, Opts, true) =:= true,
         dedupe_messages => maps:get(dedupe_messages, Opts, false) =:= true,
-        blocking_timeout => blocking_opt(maps:get(blocking_timeout, Opts, 30000)),
+        blocking_timeout => blocking_opt(maps:get(blocking_timeout, Opts, infinity)),
         task_ttl => maps:get(task_ttl, Opts, 3600000),
         max_task_queue => pos_int_opt(max_task_queue, maps:get(max_task_queue, Opts, 100)),
+        max_subscriber_queue => pos_int_opt(
+            max_subscriber_queue, maps:get(max_subscriber_queue, Opts, 1000)
+        ),
         history_default => maps:get(history_default, Opts, all),
         rate_limit => maps:get(rate_limit, Opts, undefined),
         tenant => maps:get(tenant, Opts, undefined),

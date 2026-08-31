@@ -291,7 +291,9 @@ jsonrpc(Headers, Query, Body, Responder, #{server := Server} = Cfg) ->
                         {request, Id, Method, Params} ->
                             case barrel_a2a_jsonrpc:op_for_method(Method) of
                                 {ok, Op} ->
-                                    ReqCtx = req_ctx(jsonrpc, Headers, Query, undefined, Cfg),
+                                    ReqCtx = req_ctx(
+                                        jsonrpc, Headers, Query, undefined, Responder, Cfg
+                                    ),
                                     Reply = barrel_a2a_server_core:call(Server, Op, Params, ReqCtx),
                                     jsonrpc_reply(Id, Op, Reply, ReqCtx, Responder, Cfg);
                                 error ->
@@ -402,7 +404,7 @@ rest(
                     reply_error(rest, 400, [], barrel_a2a_error:new(parse_error), Responder, Cfg);
                 {ok, Decoded} ->
                     Request = barrel_a2a_rest:build_request(Op, Bindings, Query, Decoded),
-                    ReqCtx = req_ctx(rest, Headers, Query, PathTenant, Cfg),
+                    ReqCtx = req_ctx(rest, Headers, Query, PathTenant, Responder, Cfg),
                     Reply = barrel_a2a_server_core:call(Server, Op, Request, ReqCtx),
                     rest_reply(Op, Reply, ReqCtx, Responder, Cfg)
             end
@@ -476,14 +478,41 @@ stream(Subscribe, Frame, ReqCtx, Responder, #{keepalive_ms := Keepalive} = Cfg) 
             );
         {ok, Initial} ->
             stream_start(Responder, 200, Hdrs),
-            case send_events(Initial, Frame, Responder) of
+            %% Decided once, not per event: the config is in
+            %% `persistent_term' and a stream can be long.
+            Check = outbound_stream_check(Cfg),
+            case send_events(Initial, Frame, Responder, Check) of
                 {ok, final} ->
                     stream_end(Responder);
                 {ok, more} ->
-                    stream_loop(Frame, Responder, Keepalive, maps:get(disconnected, Responder));
+                    stream_loop(
+                        Frame, Responder, Keepalive, maps:get(disconnected, Responder), Check
+                    );
                 {error, _} ->
                     stream_end(Responder)
             end
+    end.
+
+%% `validate_schema => all' means every reply, streamed ones included.
+%% A bad event cannot be answered with a status: the stream already
+%% started (invariants.md, E3), so it travels as an in-band error and
+%% ends the stream, which is what 3.3.2 asks for.
+outbound_stream_check(#{server := Server}) ->
+    case safe_config(Server) of
+        #{validate_schema := all} ->
+            fun(Ev) ->
+                case barrel_a2a_schema:validate(<<"StreamResponse">>, Ev) of
+                    ok ->
+                        ok;
+                    {error, Errors} ->
+                        logger:error(
+                            "a2a streamed event does not match the schema: ~0p", [Errors]
+                        ),
+                        {error, barrel_a2a_error:new(invalid_agent_response)}
+                end
+            end;
+        _ ->
+            fun(_) -> ok end
     end.
 
 %% Which binding a frame closure belongs to, recovered by rendering a
@@ -497,17 +526,23 @@ rest_or_jsonrpc(Frame) ->
         _ -> jsonrpc
     end.
 
-send_events([], _, _) ->
+send_events([], _, _, _) ->
     {ok, more};
-send_events([Ev | Rest], Frame, Responder) ->
-    case stream_chunk(Responder, barrel_a2a_sse:encode(Frame({event, Ev}))) of
+send_events([Ev | Rest], Frame, Responder, Check) ->
+    case Check(Ev) of
+        {error, Invalid} ->
+            _ = stream_chunk(Responder, barrel_a2a_sse:encode(Frame({error, Invalid}))),
+            {error, Invalid};
         ok ->
-            case barrel_a2a_event:is_final(Ev) of
-                true -> {ok, final};
-                false -> send_events(Rest, Frame, Responder)
-            end;
-        {error, _} = E ->
-            E
+            case stream_chunk(Responder, barrel_a2a_sse:encode(Frame({event, Ev}))) of
+                ok ->
+                    case barrel_a2a_event:is_final(Ev) of
+                        true -> {ok, final};
+                        false -> send_events(Rest, Frame, Responder, Check)
+                    end;
+                {error, _} = E ->
+                    E
+            end
     end.
 
 %% Owns the mailbox of the process it runs in: it consumes every message
@@ -515,12 +550,12 @@ send_events([Ev | Rest], Frame, Responder) ->
 %% An embedder must therefore call `handle/6' from the request process,
 %% never from a shared worker, or that worker loses its own messages
 %% (invariants.md, E1).
-stream_loop(Frame, Responder, Keepalive, Disconnected) ->
+stream_loop(Frame, Responder, Keepalive, Disconnected, Check) ->
     receive
         {a2a_task_event, _, Ev} ->
-            case send_events([Ev], Frame, Responder) of
+            case send_events([Ev], Frame, Responder, Check) of
                 {ok, final} -> stream_end(Responder);
-                {ok, more} -> stream_loop(Frame, Responder, Keepalive, Disconnected);
+                {ok, more} -> stream_loop(Frame, Responder, Keepalive, Disconnected, Check);
                 {error, _} -> stream_end(Responder)
             end;
         {a2a_task_error, _, E} ->
@@ -531,11 +566,11 @@ stream_loop(Frame, Responder, Keepalive, Disconnected) ->
         Msg ->
             case Disconnected(Msg) of
                 true -> ok;
-                false -> stream_loop(Frame, Responder, Keepalive, Disconnected)
+                false -> stream_loop(Frame, Responder, Keepalive, Disconnected, Check)
             end
     after Keepalive ->
         case stream_chunk(Responder, barrel_a2a_sse:comment(<<"keepalive">>)) of
-            ok -> stream_loop(Frame, Responder, Keepalive, Disconnected);
+            ok -> stream_loop(Frame, Responder, Keepalive, Disconnected, Check);
             {error, _} -> ok
         end
     end.
@@ -552,7 +587,7 @@ sse_headers() ->
 %% Request context
 %%--------------------------------------------------------------------
 
-req_ctx(Binding, Headers, Query, PathTenant, Cfg) ->
+req_ctx(Binding, Headers, Query, PathTenant, Responder, Cfg) ->
     Version =
         case header(<<"a2a-version">>, Headers) of
             undefined -> query_ci(<<"a2a-version">>, Query);
@@ -569,7 +604,10 @@ req_ctx(Binding, Headers, Query, PathTenant, Cfg) ->
         version => Version,
         extensions => barrel_a2a_extensions:parse_header(Ext),
         tenant => PathTenant,
-        peer => maps:get(peer, Cfg, undefined)
+        peer => maps:get(peer, Cfg, undefined),
+        %% The same predicate the streaming loop uses, so a blocking
+        %% unary call also stops waiting when the peer goes away.
+        disconnected => maps:get(disconnected, Responder)
     },
     case maps:get(principal, Cfg, undefined) of
         undefined -> Ctx;

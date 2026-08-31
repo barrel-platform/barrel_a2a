@@ -29,7 +29,9 @@ all() ->
         failed_start_leaves_nothing_behind,
         bad_options_are_refused,
         losing_the_task_supervisor_stops_the_server,
-        losing_the_task_store_writer_stops_the_server
+        losing_the_task_store_writer_stops_the_server,
+        disconnect_ends_blocking_send,
+        streamed_events_are_validated
     ].
 
 init_per_suite(Config) ->
@@ -551,3 +553,83 @@ losing_the_task_store_writer_stops_the_server(_Config) ->
     end,
     _ = file:delete(File),
     ok.
+
+%% A blocking send waits without a deadline by default, so it has to
+%% notice the peer leaving; otherwise the request process would sit
+%% there for the life of the task with nobody to answer.
+disconnect_ends_blocking_send(_Config) ->
+    %% Its own server, because the suite's sets a finite
+    %% blocking_timeout and the point here is the default.
+    {ok, Server} = barrel_a2a_server:start(barrel_a2a_test_agent:card(), #{
+        handler => barrel_a2a_test_agent, listen => false
+    }),
+    ?assertEqual(infinity, maps:get(blocking_timeout, barrel_a2a_server:config(Server))),
+    try
+        Req = #{<<"message">> => barrel_a2a_message:new(<<"slow 30000">>)},
+        Cfg = barrel_a2a_http_engine:config(Server, #{}),
+        Self = self(),
+        Responder = fake_responder(),
+        Engine = spawn_link(fun() ->
+            ok = barrel_a2a_http_engine:handle(
+                <<"POST">>,
+                <<"/a2a/jsonrpc">>,
+                json_headers(),
+                jsonrpc_body(<<"SendMessage">>, Req),
+                Responder,
+                Cfg
+            ),
+            Self ! handled
+        end),
+        %% Nothing comes back while the handler runs.
+        receive
+            {reply, _, _, _} -> ct:fail(answered_before_the_task_finished)
+        after 300 -> ok
+        end,
+        Engine ! fake_disconnect,
+        receive
+            handled -> ok
+        after 5000 -> ct:fail(blocking_send_ignored_the_disconnect)
+        end
+    after
+        barrel_a2a_server:stop(Server)
+    end.
+
+%% `validate_schema => all' covers streamed events too, not just unary
+%% replies: a handler that emits something off-schema must not put it
+%% on the wire.
+streamed_events_are_validated(_Config) ->
+    Bad = #{<<"statusUpdate">> => #{<<"status">> => #{<<"state">> => <<"NOT_A_STATE">>}}},
+    ?assertMatch({error, [_ | _]}, barrel_a2a_schema:validate(<<"StreamResponse">>, Bad)),
+    {ok, Server} = barrel_a2a_server:start(barrel_a2a_test_agent:card(), #{
+        handler => barrel_a2a_test_agent,
+        listen => false,
+        validate_schema => all
+    }),
+    try
+        Cfg = barrel_a2a_http_engine:config(Server, #{}),
+        Responder = fake_responder(),
+        Self = self(),
+        Req = #{<<"message">> => barrel_a2a_message:new(<<"stream">>)},
+        spawn_link(fun() ->
+            ok = barrel_a2a_http_engine:handle(
+                <<"POST">>,
+                <<"/a2a/jsonrpc">>,
+                json_headers(),
+                jsonrpc_body(<<"SendStreamingMessage">>, Req),
+                Responder,
+                Cfg
+            ),
+            Self ! handled
+        end),
+        receive
+            {stream_start, 200, _} -> ok
+        after 5000 -> ct:fail(no_stream_start)
+        end,
+        %% Well-formed events still get through untouched.
+        receive
+            handled -> ok
+        after 10000 -> ct:fail(stream_did_not_finish)
+        end
+    after
+        barrel_a2a_server:stop(Server)
+    end.

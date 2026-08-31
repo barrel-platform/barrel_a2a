@@ -121,8 +121,11 @@ handle_call(_Req, _From, St) ->
     {reply, {error, unsupported}, St}.
 
 %% @private
-handle_cast({deliver, Event}, St) ->
-    drain(St#st{queue = enqueue(Event, St)});
+handle_cast({deliver, Event}, #st{queue = Q, opts = Opts} = St) ->
+    case queue:len(Q) >= maps:get(max_queue, Opts) of
+        false -> drain(St#st{queue = queue:in(Event, Q)});
+        true -> overflowed(St)
+    end;
 handle_cast(stop, St) ->
     {stop, normal, St};
 handle_cast(_, St) ->
@@ -143,24 +146,18 @@ terminate(_Reason, #st{store = Store, config = #{<<"id">> := Id}}) ->
     ok.
 
 %% A webhook that is slow, or backing off, would otherwise let this
-%% queue grow for as long as the task keeps producing events. Past the
-%% bound the oldest event goes: push is at-least-once and best effort,
-%% and the newest state is the one a receiver actually needs. Dropping
-%% deliberately does not count as a failure, or a merely slow endpoint
-%% would lose its configuration to `max_failures'.
-enqueue(Event, #st{queue = Q, opts = Opts, config = Config}) ->
-    Max = maps:get(max_queue, Opts),
-    case queue:len(Q) >= Max of
-        false ->
-            queue:in(Event, Q);
-        true ->
-            {_, Q1} = queue:out(Q),
-            logger:warning(
-                "a2a push queue full for config ~s, dropping the oldest of ~b events",
-                [maps:get(<<"id">>, Config), Max]
-            ),
-            queue:in(Event, Q1)
-    end.
+%% queue grow for as long as the task keeps producing events, so it is
+%% bounded by `max_queue'. Reaching the bound counts as a delivery
+%% failure rather than a silent discard: 4.3 promises at-least-once,
+%% and the only honest way to bound memory under that promise is to
+%% give up on the receiver visibly. `max_failures' then drops the
+%% configuration, which 4.3 explicitly allows.
+overflowed(#st{opts = Opts, config = Config} = St) ->
+    logger:warning(
+        "a2a push: receiver ~s is not keeping up, ~b events queued for config ~s",
+        [maps:get(<<"url">>, Config), maps:get(max_queue, Opts), maps:get(<<"id">>, Config)]
+    ),
+    failed(queue_full, St).
 
 %% Send queued events one at a time until the queue is empty, a
 %% delivery fails (then wait for the backoff timer) or a final event

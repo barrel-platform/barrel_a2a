@@ -207,6 +207,9 @@ drop_until(Rows, {Ms, Id}) ->
 split(N, List) when length(List) =< N -> {List, []};
 split(N, List) -> lists:split(N, List).
 
+%% The range is enforced by `barrel_a2a_validate' before a request gets
+%% here, so this only has to pick the default for an unspecified size.
+%% The clamp stays as a floor under a direct caller of the registry.
 page_size(Filter) ->
     case maps:get(page_size, Filter, ?DEFAULT_PAGE) of
         N when is_integer(N), N > 0 -> min(N, ?MAX_PAGE);

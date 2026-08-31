@@ -48,6 +48,10 @@
 
 -type req_ctx() :: #{
     binding := jsonrpc | rest | grpc | atom(),
+    %% Recognises the transport's "peer is gone" message, so a blocking
+    %% send stops waiting when there is no longer anyone to answer.
+    %% Omitted by a binding that cannot tell.
+    disconnected => fun((term()) -> boolean()),
     headers => [{binary(), binary()}],
     version => binary() | undefined,
     extensions => [binary()],
@@ -85,7 +89,8 @@
     handler := barrel_a2a_handler:handler(),
     registry := barrel_a2a_task_registry:table(),
     push_notify := undefined | fun((binary(), barrel_a2a:stream_response()) -> ok),
-    max_task_queue := pos_integer()
+    max_task_queue := pos_integer(),
+    max_subscriber_queue := pos_integer()
 }.
 
 %% What the request knew, carried into the task process so that a
@@ -640,7 +645,8 @@ task_cfg(Cfg) ->
         handler => maps:get(handler, Cfg),
         registry => maps:get(registry, Cfg),
         push_notify => maps:get(push_notify, Cfg, undefined),
-        max_task_queue => maps:get(max_task_queue, Cfg)
+        max_task_queue => maps:get(max_task_queue, Cfg),
+        max_subscriber_queue => maps:get(max_subscriber_queue, Cfg)
     }.
 
 attach_push(#{cfg := #{push := false}}, _Pid, Configuration) ->
@@ -705,15 +711,29 @@ subscribe_follow_up(Pid, Message, TaskReq) ->
     end.
 
 await_reply(Env, Pid, HistoryLength, Timeout) ->
-    Result = barrel_a2a_task_proc:await(Pid, Timeout),
+    Result = barrel_a2a_task_proc:await(Pid, Timeout, disconnected(Env)),
     barrel_a2a_task_proc:unsubscribe(Pid, self()),
     flush_events(),
     case Result of
-        {task, Task} -> {ok, #{<<"task">> => with_history(Env, Task, HistoryLength)}};
-        {message, Message} -> {ok, #{<<"message">> => Message}};
-        {error, #{type := _} = E} -> fail(E);
-        {error, Reason} -> fail(barrel_a2a_error:internal(Reason))
+        {task, Task} ->
+            {ok, #{<<"task">> => with_history(Env, Task, HistoryLength)}};
+        {message, Message} ->
+            {ok, #{<<"message">> => Message}};
+        {error, disconnected} ->
+            %% Nobody is left to read a reply. Say so rather than
+            %% inventing one; the write that follows will fail
+            %% harmlessly on a stream that is already gone.
+            fail(barrel_a2a_error:new(unavailable, <<"Client disconnected while waiting">>));
+        {error, #{type := _} = E} ->
+            fail(E);
+        {error, Reason} ->
+            fail(barrel_a2a_error:internal(Reason))
     end.
+
+%% How this binding says "the peer is gone". A binding that cannot tell
+%% supplies nothing and a blocking wait then runs to its deadline.
+disconnected(#{ctx := Ctx}) ->
+    maps:get(disconnected, Ctx, fun(_) -> false end).
 
 flush_events() ->
     receive
