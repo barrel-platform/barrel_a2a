@@ -406,3 +406,59 @@ full_queue_counts_as_a_failure_test() ->
     %% Giving up is visible: the configuration is gone, not silently
     %% collecting events nobody will ever receive.
     ?assertEqual(error, barrel_a2a_push:get(Store, ?TASK, Id)).
+
+%% Bounding the worker's own queue is not enough: the task process casts
+%% to it, so while the worker is busy the events land in its mailbox
+%% first. `barrel_a2a_push:notify/3' therefore checks the backlog before
+%% casting and records what it could not hand over.
+mailbox_overflow_is_recorded_test() ->
+    Store = barrel_a2a_push:new_store(),
+    Test = self(),
+    %% A webhook that blocks until the test lets it finish, so the
+    %% worker is busy and its mailbox is the thing that fills.
+    Post = fun(_Url, _Headers, _Body) ->
+        Test ! posting,
+        receive
+            release -> {ok, 204}
+        end
+    end,
+    Opts = (worker_opts(Post))#{max_queue => 1},
+    {ok, C} = barrel_a2a_push:create(Store, ?TASK, config(), Opts),
+    Id = maps:get(<<"id">>, C),
+    ok = barrel_a2a_push:notify(Store, ?TASK, status_event(<<"TASK_STATE_WORKING">>)),
+    receive
+        posting -> ok
+    after 2000 -> error(no_post)
+    end,
+    %% One sits in the mailbox, the rest cannot be handed over at all.
+    [
+        ok = barrel_a2a_push:notify(Store, ?TASK, status_event(<<"TASK_STATE_WORKING">>))
+     || _ <- lists:seq(1, 5)
+    ],
+    ?assert(barrel_a2a_push:take_overflow(Store, Id) > 0),
+    %% Let the blocked POST finish so the worker can wind down.
+    [{_, Pid}] = ets:lookup(Store, {worker, Id}),
+    Pid ! release,
+    ok.
+
+%% One overflow is enough to give up when max_failures is 1, which is
+%% how a receiver that never keeps up loses its configuration.
+mailbox_overflow_counts_as_a_failure_test() ->
+    Store = barrel_a2a_push:new_store(),
+    Opts = (worker_opts(script([{ok, 204}])))#{max_queue => 5, max_failures => 1},
+    {ok, C} = barrel_a2a_push:create(Store, ?TASK, config(), Opts),
+    Id = maps:get(<<"id">>, C),
+    {ok, Pid} = barrel_a2a_push_delivery:start_link(C, Opts, Store),
+    Mon = monitor(process, Pid),
+    _ = ets:update_counter(Store, {overflow, Id}, 2, {{overflow, Id}, 0}),
+    barrel_a2a_push_delivery:deliver(Pid, status_event(<<"TASK_STATE_WORKING">>)),
+    ?assertEqual(normal, wait_down(Pid, Mon)),
+    ?assertEqual(error, barrel_a2a_push:get(Store, ?TASK, Id)).
+
+%% The overflow counter is read once and cleared.
+take_overflow_test() ->
+    Store = barrel_a2a_push:new_store(),
+    ?assertEqual(0, barrel_a2a_push:take_overflow(Store, <<"nope">>)),
+    _ = ets:update_counter(Store, {overflow, <<"c">>}, 3, {{overflow, <<"c">>}, 0}),
+    ?assertEqual(3, barrel_a2a_push:take_overflow(Store, <<"c">>)),
+    ?assertEqual(0, barrel_a2a_push:take_overflow(Store, <<"c">>)).

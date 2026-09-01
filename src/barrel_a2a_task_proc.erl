@@ -275,7 +275,7 @@ init(
 ) ->
     process_flag(trap_exit, true),
     Task0 = barrel_a2a_task:new(Id, Ctx, #{metadata => maps:get(metadata, A, undefined)}),
-    Task = barrel_a2a_task:add_history(Task0, Msg),
+    Task = barrel_a2a_task:add_history(Task0, Msg, history_limit(Cfg)),
     {ok, #st{
         cfg = Cfg,
         task = Task,
@@ -521,7 +521,7 @@ queue_message(#st{queue = Q, cfg = Cfg} = St, Message, Req) ->
                 St};
         false ->
             St1 = do_materialize(St),
-            Task = barrel_a2a_task:add_history(St1#st.task, Message),
+            Task = barrel_a2a_task:add_history(St1#st.task, Message, history_limit(St1#st.cfg)),
             St2 = store(St1#st{task = Task, last_message = Message}),
             {reply, ok, maybe_start_worker(St2#st{queue = Q ++ [{Message, Req}]})}
     end.
@@ -667,7 +667,7 @@ transition(St, State, Message) ->
     Task =
         case Msg of
             undefined -> Task0;
-            _ -> barrel_a2a_task:add_history(Task0, Msg)
+            _ -> barrel_a2a_task:add_history(Task0, Msg, history_limit(St#st.cfg))
         end,
     %% Row before event, as in do_materialize/1 (invariants.md, T2).
     St1 = store(St#st{task = Task}),
@@ -727,6 +727,8 @@ send_all(#st{subscribers = Subs} = St, Msg) ->
         Subs
     ),
     St#st{subscribers = Kept}.
+
+history_limit(Cfg) -> maps:get(max_history, Cfg, unlimited).
 
 %% A dead subscriber reports no backlog; its monitor cleans it up.
 backlog(Pid) ->

@@ -324,7 +324,10 @@ push_config_ref(_) ->
 list_push_configs_request(R) when is_map(R) ->
     check([
         fun() -> required_string(R, <<"taskId">>, <<>>) end,
-        fun() -> optional_int_range(R, <<"pageSize">>, <<>>, 1, 100) end,
+        %% Not the 1..100 of ListTasks: the specification states no
+        %% bounds for ListTaskPushNotificationConfigs (a2a.proto,
+        %% page_size = 2). Do not merge the two.
+        fun() -> optional_non_neg_int(R, <<"pageSize">>, <<>>) end,
         fun() -> optional_string(R, <<"pageToken">>, <<>>) end,
         fun() -> optional_string(R, <<"tenant">>, <<>>) end
     ]);

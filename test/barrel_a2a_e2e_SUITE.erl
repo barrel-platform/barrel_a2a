@@ -36,6 +36,7 @@ groups() ->
         client_timeout,
         follow_up_input_required,
         follow_up_queue_is_bounded,
+        slow_stream_listener_is_dropped,
         auth_required_resume,
         list_tasks_filters,
         list_tasks_scoping,
@@ -1134,3 +1135,32 @@ follow_up_queue_is_bounded(Config) ->
     after
         barrel_a2a_server:stop(Server)
     end.
+
+%% The client side of the rule the server applies to its SSE
+%% subscribers: a `stream_to/2' listener that stops reading, without
+%% dying, is dropped and told once. Its process is left alone, because
+%% the caller owns it.
+slow_stream_listener_is_dropped(Config) ->
+    Agent = connect(Config),
+    Test = self(),
+    Slow = spawn(fun() ->
+        Test ! {ready, self()},
+        receive
+            release -> ok
+        end
+    end),
+    receive
+        {ready, Slow} -> ok
+    after 2000 -> ct:fail(no_listener)
+    end,
+    {ok, RT} = barrel_a2a_client:start(Agent, <<"stream">>, #{max_listener_queue => 1}),
+    ok = barrel_a2a_remote_task:stream_to(RT, Slow),
+    {ok, _} = barrel_a2a_remote_task:result(RT, 10000),
+    %% It never ran, so everything sent to it is still queued.
+    {messages, Msgs} = erlang:process_info(Slow, messages),
+    Errors = [E || {a2a_error, _, #{type := unavailable} = E} <- Msgs],
+    ?assertEqual(1, length(Errors)),
+    %% Told exactly once, and nothing after it.
+    ?assertMatch({a2a_error, _, _}, lists:last(Msgs)),
+    ?assert(is_process_alive(Slow)),
+    Slow ! release.

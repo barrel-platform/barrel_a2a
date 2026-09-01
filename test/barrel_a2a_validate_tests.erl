@@ -544,6 +544,20 @@ list_push_configs_request_test_() ->
                 <<"tenant">> => <<"x">>
             })
         ),
+        %% The 1..100 range belongs to ListTasks alone. The
+        %% specification states no bounds for this operation, so a size
+        %% ListTasks would refuse is fine here. These two validators
+        %% look alike; they are not the same.
+        ?_assertEqual(
+            ok,
+            barrel_a2a_validate:list_push_configs_request(#{
+                <<"taskId">> => <<"t">>, <<"pageSize">> => 101
+            })
+        ),
+        ?_assertMatch(
+            {error, {invalid, <<"pageSize">>, _}},
+            barrel_a2a_validate:list_tasks_request(#{<<"pageSize">> => 101})
+        ),
         failures(fun barrel_a2a_validate:list_push_configs_request/1, [
             {"not object", 1, <<>>},
             {"taskId missing", #{}, <<"taskId">>},

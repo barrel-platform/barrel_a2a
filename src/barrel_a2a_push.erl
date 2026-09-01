@@ -23,7 +23,7 @@
 
 -export([new_store/0, create/4, get/3, list/4, delete/3, delete_task/2, notify/3]).
 -export([validate_url/2, normalize_opts/1]).
--export([opts/1]).
+-export([opts/1, take_overflow/2]).
 
 -type store() :: ets:table().
 -type opts() :: #{
@@ -138,6 +138,8 @@ list(Store, TaskId, PageSize, PageToken) ->
 -spec delete(store(), binary(), binary()) -> ok.
 delete(Store, TaskId, Id) ->
     true = ets:delete(Store, {TaskId, Id}),
+    %% The worker reads and clears this itself, but it may be gone.
+    _ = ets:delete(Store, {overflow, Id}),
     stop_worker(Store, Id).
 
 %% @doc Remove every config of a task and stop their workers.
@@ -157,12 +159,12 @@ notify(Store, TaskId, Event) ->
         fun({Id, Config}) ->
             case worker(Store, Id) of
                 {ok, Pid} ->
-                    barrel_a2a_push_delivery:deliver(Pid, Event);
+                    hand_off(Store, Id, Pid, Event, Opts);
                 error ->
                     case start_worker(Store, Config, Opts) of
                         {ok, Pid} ->
                             true = ets:insert(Store, {{worker, Id}, Pid}),
-                            barrel_a2a_push_delivery:deliver(Pid, Event);
+                            hand_off(Store, Id, Pid, Event, Opts);
                         {error, Reason} ->
                             logger:warning(
                                 "a2a push: cannot start delivery worker for ~s: ~0p",
@@ -173,6 +175,41 @@ notify(Store, TaskId, Event) ->
         end,
         configs(Store, TaskId)
     ).
+
+%% Bounding the worker's own queue is not enough: this runs in the task
+%% process and casts, so while the worker is blocked in a POST the
+%% events pile up in its mailbox, which it only inspects afterwards.
+%% Check the backlog here instead, and when it is full record the
+%% overflow in the store rather than sending anything, so the buffer we
+%% are bounding does not grow to report that it is full. The worker
+%% turns the count into a delivery failure on its next pass, which is
+%% what keeps at-least-once honest.
+%%
+%% Both operations are local and cheap, as invariant T10 requires of
+%% anything on this path.
+hand_off(Store, Id, Pid, Event, Opts) ->
+    case backlog(Pid) < maps:get(max_queue, Opts) of
+        true ->
+            barrel_a2a_push_delivery:deliver(Pid, Event);
+        false ->
+            _ = ets:update_counter(Store, {overflow, Id}, 1, {{overflow, Id}, 0}),
+            ok
+    end.
+
+backlog(Pid) ->
+    case process_info(Pid, message_queue_len) of
+        {message_queue_len, Len} -> Len;
+        undefined -> 0
+    end.
+
+%% @doc How many events were dropped before reaching the worker's
+%% mailbox since the last call, resetting the count.
+-spec take_overflow(store(), binary()) -> non_neg_integer().
+take_overflow(Store, Id) ->
+    case ets:take(Store, {overflow, Id}) of
+        [{_, N}] -> N;
+        [] -> 0
+    end.
 
 %%--------------------------------------------------------------------
 %% URL validation (13.2)

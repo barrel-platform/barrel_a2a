@@ -969,3 +969,34 @@ etag_test_() ->
             )
         )
     ].
+
+%% History is stored whole by default, as the reference implementation
+%% does: `historyLength' truncates a reply, not the stored task. A
+%% server that runs very long tasks can opt into a cap.
+add_history_default_is_unbounded_test() ->
+    T = lists:foldl(
+        fun(N, Acc) -> barrel_a2a_task:add_history(Acc, hmsg(N)) end,
+        barrel_a2a_task:new(<<"t">>, <<"c">>),
+        lists:seq(1, 50)
+    ),
+    ?assertEqual(50, length(barrel_a2a_task:history(T))).
+
+add_history_limit_keeps_the_newest_test() ->
+    T = lists:foldl(
+        fun(N, Acc) -> barrel_a2a_task:add_history(Acc, hmsg(N), 3) end,
+        barrel_a2a_task:new(<<"t">>, <<"c">>),
+        lists:seq(1, 10)
+    ),
+    Texts = [barrel_a2a_message:text(M) || M <- barrel_a2a_task:history(T)],
+    ?assertEqual([<<"8">>, <<"9">>, <<"10">>], Texts).
+
+%% Below the limit nothing is dropped, and the limit is inclusive.
+add_history_limit_is_inclusive_test() ->
+    T = lists:foldl(
+        fun(N, Acc) -> barrel_a2a_task:add_history(Acc, hmsg(N), 3) end,
+        barrel_a2a_task:new(<<"t">>, <<"c">>),
+        lists:seq(1, 3)
+    ),
+    ?assertEqual(3, length(barrel_a2a_task:history(T))).
+
+hmsg(N) -> barrel_a2a_message:new(integer_to_binary(N)).

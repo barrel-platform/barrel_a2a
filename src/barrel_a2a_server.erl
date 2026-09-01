@@ -70,6 +70,11 @@
 %%%   subscriber may leave unread before its stream is ended. A client
 %%%   that stops reading without disconnecting cannot otherwise be
 %%%   told apart from a slow one.
+%%% - `max_history': `unlimited' (default) stores every message of a
+%%%   task, and `historyLength' then truncates only what a reply
+%%%   carries, which is what the reference implementation does. A
+%%%   positive integer caps what is stored, dropping the oldest, for a
+%%%   server running very long multi-turn tasks.
 %%% - `hsts' (default `true' when TLS), `rate_limit' hook
 %%%   `fun((ReqCtx) -> ok | {error, RetryAfterSeconds})'.
 %%% @end
@@ -136,6 +141,8 @@
     max_task_queue := pos_integer(),
     %% How far behind a stream subscriber may fall before it is dropped.
     max_subscriber_queue := pos_integer(),
+    %% A cap on stored task history, off by default.
+    max_history := unlimited | pos_integer(),
     history_default := all | non_neg_integer(),
     %% Where the bindings are mounted. `engine' is the subset handed to
     %% `barrel_a2a_http_engine:config/2'.
@@ -413,6 +420,7 @@ build_config(InstSup, Card0, Opts) ->
         max_subscriber_queue => pos_int_opt(
             max_subscriber_queue, maps:get(max_subscriber_queue, Opts, 1000)
         ),
+        max_history => history_limit_opt(maps:get(max_history, Opts, unlimited)),
         history_default => maps:get(history_default, Opts, all),
         rate_limit => maps:get(rate_limit, Opts, undefined),
         tenant => maps:get(tenant, Opts, undefined),
@@ -450,6 +458,10 @@ schema_opt(all) -> all;
 schema_opt(false) -> false;
 schema_opt(true) -> inbound;
 schema_opt(Other) -> throw({invalid_option, {validate_schema, Other}}).
+
+history_limit_opt(unlimited) -> unlimited;
+history_limit_opt(N) when is_integer(N), N > 0 -> N;
+history_limit_opt(Other) -> throw({invalid_option, {max_history, Other}}).
 
 pos_int_opt(_, N) when is_integer(N), N > 0 -> N;
 pos_int_opt(Key, Other) -> throw({invalid_option, {Key, Other}}).

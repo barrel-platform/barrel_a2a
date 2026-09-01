@@ -93,20 +93,48 @@ headers(Config) ->
         end,
     Base ++ Auth ++ Token.
 
+%% Only the status matters here, and a receiver we do not control is on
+%% the other end. Async mode lets the connection be closed the moment
+%% the status line arrives, so a hostile webhook cannot answer a
+%% notification with a body large enough to matter; hackney 4.7 ignores
+%% `with_body' and would otherwise collect all of it.
 hackney_post(Url, Headers, Body, Timeout) ->
     HackneyOpts = [
-        with_body,
+        async,
         {follow_redirect, false},
         {connect_timeout, Timeout},
         {recv_timeout, Timeout}
     ],
     try hackney:request(post, Url, Headers, Body, HackneyOpts) of
+        {ok, Ref} -> await_status(Ref, Timeout);
         {ok, Status, _RespHeaders, _RespBody} -> {ok, Status};
         {ok, Status, _RespHeaders} -> {ok, Status};
         {error, Reason} -> {error, Reason}
     catch
         Class:Reason -> {error, {Class, Reason}}
     end.
+
+await_status(Ref, Timeout) ->
+    receive
+        {hackney_response, Ref, {status, Status, _}} ->
+            close_ref(Ref),
+            {ok, Status};
+        {hackney_response, Ref, {error, Reason}} ->
+            {error, Reason};
+        {hackney_response, Ref, _Other} ->
+            await_status(Ref, Timeout)
+    after Timeout ->
+        close_ref(Ref),
+        {error, timeout}
+    end.
+
+close_ref(Ref) ->
+    try
+        hackney:close(Ref)
+    catch
+        _:_ -> ok
+    end,
+    ok.
 
 %%--------------------------------------------------------------------
 %% gen_server
@@ -124,7 +152,7 @@ handle_call(_Req, _From, St) ->
 handle_cast({deliver, Event}, #st{queue = Q, opts = Opts} = St) ->
     case queue:len(Q) >= maps:get(max_queue, Opts) of
         false -> drain(St#st{queue = queue:in(Event, Q)});
-        true -> overflowed(St)
+        true -> overflowed(1, St)
     end;
 handle_cast(stop, St) ->
     {stop, normal, St};
@@ -152,10 +180,10 @@ terminate(_Reason, #st{store = Store, config = #{<<"id">> := Id}}) ->
 %% and the only honest way to bound memory under that promise is to
 %% give up on the receiver visibly. `max_failures' then drops the
 %% configuration, which 4.3 explicitly allows.
-overflowed(#st{opts = Opts, config = Config} = St) ->
+overflowed(N, #st{config = Config} = St) ->
     logger:warning(
-        "a2a push: receiver ~s is not keeping up, ~b events queued for config ~s",
-        [maps:get(<<"url">>, Config), maps:get(max_queue, Opts), maps:get(<<"id">>, Config)]
+        "a2a push: receiver ~s is not keeping up, ~b events could not be queued for config ~s",
+        [maps:get(<<"url">>, Config), N, maps:get(<<"id">>, Config)]
     ),
     failed(queue_full, St).
 
@@ -164,7 +192,17 @@ overflowed(#st{opts = Opts, config = Config} = St) ->
 %% went through.
 drain(#st{timer = Ref} = St) when Ref =/= undefined ->
     {noreply, St};
-drain(#st{queue = Q} = St) ->
+drain(#st{store = Store, config = #{<<"id">> := Id}} = St) ->
+    %% Events the task process could not even hand over, because this
+    %% mailbox was already full (barrel_a2a_push:hand_off/5). They are
+    %% failures like any other, so a receiver that never keeps up
+    %% reaches `max_failures' and loses its configuration.
+    case barrel_a2a_push:take_overflow(Store, Id) of
+        0 -> drain_queue(St);
+        N -> overflowed(N, St)
+    end.
+
+drain_queue(#st{queue = Q} = St) ->
     case queue:out(Q) of
         {empty, _} ->
             {noreply, St};
@@ -181,7 +219,7 @@ delivered(Event, St) ->
             remove_config(St),
             {stop, normal, St};
         false ->
-            drain(St)
+            drain_queue(St)
     end.
 
 failed(Reason, #st{failures = N, opts = Opts, config = Config} = St) ->

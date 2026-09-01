@@ -164,9 +164,15 @@ registry and stops a listener that already started. It reads the
 partial config back from `persistent_term`, which is why F2's repeated
 write matters for more than the listener.
 
-**F4. The task and push supervisors are linked, not supervised.** The
-server starts them from its own `init/1` (see
-`barrel_a2a_server_inst_sup` for why). It therefore traps exits and
-turns the death of either into its own `{stop, _}`, so the instance
-supervisor rebuilds the whole server rather than leaving one holding a
-dead pid.
+**F4. The processes the server owns are linked, not supervised.** The
+server starts the task and push supervisors from its own `init/1`, and a
+process-backed task store reports its writer through
+`barrel_a2a_task_store:owner/1`. It traps exits and turns the death of
+any of the three into its own `{stop, _}`, so the instance supervisor
+rebuilds the whole instance rather than leaving the server holding a
+dead pid. That matters most for the store writer, which owns the ETS
+working copy: its death destroys the data.
+
+This shape is deliberate and gets re-reported as a defect; decision
+record [0006](../decisions/0006-owned-processes-are-linked-not-supervised.md)
+has the reasoning, the lifecycle rules and the tests that cover them.
