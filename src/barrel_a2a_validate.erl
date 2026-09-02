@@ -247,7 +247,7 @@ list_tasks_request(R) when is_map(R) ->
                 _ -> enum(R, <<"status">>, <<>>, fun barrel_a2a_task_state:from_wire/1)
             end
         end,
-        fun() -> optional_non_neg_int(R, <<"pageSize">>, <<>>) end,
+        fun() -> optional_int_range(R, <<"pageSize">>, <<>>, 1, 100) end,
         fun() -> optional_string(R, <<"pageToken">>, <<>>) end,
         fun() -> optional_non_neg_int(R, <<"historyLength">>, <<>>) end,
         fun() -> optional_timestamp(R, <<"statusTimestampAfter">>, <<>>) end,
@@ -324,6 +324,9 @@ push_config_ref(_) ->
 list_push_configs_request(R) when is_map(R) ->
     check([
         fun() -> required_string(R, <<"taskId">>, <<>>) end,
+        %% Not the 1..100 of ListTasks: the specification states no
+        %% bounds for ListTaskPushNotificationConfigs (a2a.proto,
+        %% page_size = 2). Do not merge the two.
         fun() -> optional_non_neg_int(R, <<"pageSize">>, <<>>) end,
         fun() -> optional_string(R, <<"pageToken">>, <<>>) end,
         fun() -> optional_string(R, <<"tenant">>, <<>>) end
@@ -435,6 +438,27 @@ optional_non_neg_int(M, Key, Path) ->
         undefined -> ok;
         I when is_integer(I), I >= 0 -> ok;
         _ -> {error, {invalid, join(Path, Key), <<"must be a non-negative integer">>}}
+    end.
+
+%% The specification fixes this range: "The minimum value is 1. The
+%% maximum value is 100." An absent value means unspecified and the
+%% service picks its default; an explicit one outside the range is a
+%% bad request, not something to quietly clamp.
+optional_int_range(M, Key, Path, Min, Max) ->
+    case maps:get(Key, M, undefined) of
+        undefined ->
+            ok;
+        I when is_integer(I), I >= Min, I =< Max ->
+            ok;
+        _ ->
+            {error,
+                {invalid, join(Path, Key),
+                    iolist_to_binary([
+                        <<"must be an integer between ">>,
+                        integer_to_binary(Min),
+                        <<" and ">>,
+                        integer_to_binary(Max)
+                    ])}}
     end.
 
 optional_bool(M, Key, Path) ->

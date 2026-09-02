@@ -71,6 +71,7 @@
 
 -define(POLL_MS, 1000).
 -define(MAX_QUEUE, 1000).
+-define(MAX_LISTENER_QUEUE, 1000).
 
 -record(st, {
     agent :: barrel_a2a_client:agent(),
@@ -93,7 +94,7 @@
     %% or parks a puller when it is empty. `queue' only fills while
     %% there is no listener, since a listener consumes events as they
     %% arrive, and is capped at ?MAX_QUEUE with the oldest dropped.
-    listeners = [] :: [pid()],
+    listeners = #{} :: #{pid() => reference()},
     waiters = [] :: [gen_server:from()],
     queue = [] :: [barrel_a2a:stream_response()],
     pullers = [] :: [gen_server:from()],
@@ -111,7 +112,10 @@
     %% The state a handle attached to with `attach/3'. Without it,
     %% attaching to an already paused task would settle immediately on
     %% its first snapshot and report that pause as the outcome.
-    attach_state :: barrel_a2a:state() | undefined
+    attach_state :: barrel_a2a:state() | undefined,
+    %% How far behind a `stream_to/2' listener may fall before its
+    %% stream is ended. From the `max_listener_queue' option.
+    max_listener_queue = ?MAX_LISTENER_QUEUE :: pos_integer()
 }).
 
 %%--------------------------------------------------------------------
@@ -230,7 +234,12 @@ init(#{agent := Agent, owner := Owner} = Args) ->
             true -> streaming;
             false -> polling
         end,
-    St0 = #st{agent = Agent, mode = Mode},
+    Opts = maps:get(opts, Args, #{}),
+    St0 = #st{
+        agent = Agent,
+        mode = Mode,
+        max_listener_queue = maps:get(max_listener_queue, Opts, ?MAX_LISTENER_QUEUE)
+    },
     case Args of
         #{request := Request} -> begin_send(Request, St0);
         #{task_id := TaskId} -> begin_attach(TaskId, St0)
@@ -303,16 +312,16 @@ begin_attach(TaskId, #st{agent = Agent} = St) ->
 handle_call({stream_to, Pid}, _From, #st{listeners = L} = St) ->
     %% Idempotent: registering the same process twice would monitor it
     %% twice and deliver every event to it twice.
-    case lists:member(Pid, L) of
+    case maps:is_key(Pid, L) of
         true ->
             {reply, ok, St};
         false ->
-            _ = erlang:monitor(process, Pid),
+            Ref = erlang:monitor(process, Pid),
             %% Replay what was queued so far, then live events.
             lists:foreach(fun(Ev) -> Pid ! {a2a_event, self(), Ev} end, St#st.queue),
-            St1 = St#st{listeners = [Pid | L], queue = []},
+            St1 = St#st{listeners = L#{Pid => Ref}, queue = []},
             case St1#st.settled of
-                true -> notify_done([Pid], St1);
+                true -> notify_done(#{Pid => Ref}, St1);
                 false -> ok
             end,
             {reply, ok, St1}
@@ -419,8 +428,9 @@ handle_info(poll, #st{agent = Agent, task_id = Id} = St) when Id =/= undefined -
 handle_info(poll, St) ->
     {noreply, schedule_poll(St#st{poll_timer = undefined})};
 handle_info({'DOWN', _, process, Pid, _}, #st{listeners = L} = St) ->
-    case lists:member(Pid, L) of
-        true -> {noreply, St#st{listeners = lists:delete(Pid, L)}};
+    case maps:is_key(Pid, L) of
+        true -> {noreply, St#st{listeners = maps:remove(Pid, L)}};
+        %% Not a listener, so it is the owner: the handle goes with it.
         false -> {stop, normal, St}
     end;
 handle_info(_Other, St) ->
@@ -532,19 +542,55 @@ settled_state(Task) ->
 %% bound the oldest event goes, so `next/2' keeps returning the most
 %% recent progress; the task snapshot in `#st.task' is folded from
 %% every event regardless, so nothing about the final outcome is lost.
-deliver(Ev, #st{listeners = [], pullers = [], queue = Q} = St) ->
+deliver(Ev, #st{listeners = L, pullers = [], queue = Q} = St) when map_size(L) =:= 0 ->
     Trimmed =
         case length(Q) >= ?MAX_QUEUE of
             true -> tl(Q);
             false -> Q
         end,
     St#st{queue = Trimmed ++ [Ev]};
-deliver(Ev, #st{listeners = [], pullers = [From | Rest]} = St) ->
+deliver(Ev, #st{listeners = L, pullers = [From | Rest]} = St) when map_size(L) =:= 0 ->
     gen_server:reply(From, {ok, Ev}),
     St#st{pullers = Rest};
 deliver(Ev, #st{listeners = L} = St) ->
-    lists:foreach(fun(Pid) -> Pid ! {a2a_event, self(), Ev} end, L),
-    St.
+    %% The same rule as the server applies to its SSE subscribers: a
+    %% listener that has stopped reading, without dying, would grow this
+    %% node one event at a time. Past `max_listener_queue' it is
+    %% dropped, told once, and sent nothing further. Its process is left
+    %% alone, because the caller of `stream_to/2' owns it.
+    Kept = maps:filter(
+        fun(Pid, Ref) ->
+            case backlog(Pid) of
+                Len when Len > St#st.max_listener_queue ->
+                    evict(St, Pid, Ref, Len),
+                    false;
+                _ ->
+                    Pid ! {a2a_event, self(), Ev},
+                    true
+            end
+        end,
+        L
+    ),
+    St#st{listeners = Kept}.
+
+%% A dead listener reports no backlog; its monitor cleans it up.
+backlog(Pid) ->
+    case process_info(Pid, message_queue_len) of
+        {message_queue_len, Len} -> Len;
+        undefined -> 0
+    end.
+
+evict(St, Pid, Ref, Len) ->
+    logger:warning(
+        "a2a remote task ~0p: dropping listener ~p, ~b events unread",
+        [St#st.task_id, Pid, Len]
+    ),
+    _ = erlang:demonitor(Ref, [flush]),
+    %% One termination message, in the shape a listener already expects
+    %% a stream to end with.
+    Pid !
+        {a2a_error, self(), barrel_a2a_error:new(unavailable, <<"Listener fell too far behind">>)},
+    ok.
 
 settle(Outcome, St) ->
     Outcome1 =
@@ -582,4 +628,4 @@ notify_done(Listeners, St) ->
             {ok, Task} -> {a2a_done, self(), Task};
             {error, E} -> {a2a_error, self(), E}
         end,
-    lists:foreach(fun(Pid) -> Pid ! Msg end, Listeners).
+    maps:foreach(fun(Pid, _Ref) -> Pid ! Msg end, Listeners).

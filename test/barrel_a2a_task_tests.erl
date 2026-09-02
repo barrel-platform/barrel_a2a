@@ -1057,3 +1057,66 @@ ctx_fields_test_() ->
         ?assertEqual(#{<<"task">> => <<"meta">>}, barrel_a2a_task:metadata(T)),
         ?assertEqual(completed, barrel_a2a_task:state(T))
     end).
+
+%% A subscriber that stops reading without disconnecting would grow the
+%% node one event at a time. Past `max_subscriber_queue' it is dropped,
+%% told once, and sent nothing further; its process is left alone,
+%% because an embedder owns it.
+slow_subscriber_is_dropped_test_() ->
+    t(fun() ->
+        Handler = fun(Ctx, _Msg) ->
+            lists:foreach(
+                fun(N) ->
+                    ok = barrel_a2a_ctx:status(Ctx, working, #{
+                        message => integer_to_binary(N)
+                    })
+                end,
+                lists:seq(1, 12)
+            ),
+            {ok, <<"done">>}
+        end,
+        %% A subscriber that never reads its mailbox.
+        Test = self(),
+        Slow = spawn(fun() ->
+            Test ! {ready, self()},
+            receive
+                release -> ok
+            end
+        end),
+        {ready, Slow} = recv(ready),
+        #{pid := Pid, id := Id} = start(Handler, #{max_subscriber_queue => 3}),
+        {ok, _} = barrel_a2a_task_proc:subscribe(Pid, Slow),
+        ok = barrel_a2a_task_proc:run(Pid),
+        %% This process keeps reading, so it sees the whole stream.
+        _ = expect_task(Id),
+        _ = drain_until_final(Id, 40),
+        %% The slow one was cut off and told why, and is still alive.
+        ?assert(is_process_alive(Slow)),
+        Slow ! release,
+        ?assert(saw_termination(Slow))
+    end).
+
+%% Read the slow subscriber's mailbox from the outside: it never ran, so
+%% whatever the task sent it is still queued.
+saw_termination(Pid) ->
+    {messages, Msgs} = erlang:process_info(Pid, messages),
+    Errors = [E || {a2a_task_error, _, #{type := unavailable} = E} <- Msgs],
+    Events = [E || {a2a_task_event, _, _} = E <- Msgs],
+    %% One termination message, and it is the last thing sent.
+    length(Errors) =:= 1 andalso
+        length(Events) =< 4 andalso
+        lists:last([M || M <- Msgs, element(1, M) =/= ready]) =:=
+            hd([{a2a_task_error, I, E} || {a2a_task_error, I, E} <- Msgs]).
+
+drain_until_final(_Id, 0) ->
+    error(no_final_event);
+drain_until_final(Id, N) ->
+    case recv() of
+        {a2a_task_event, Id, Ev} ->
+            case barrel_a2a_event:is_final(Ev) of
+                true -> ok;
+                false -> drain_until_final(Id, N - 1)
+            end;
+        _ ->
+            drain_until_final(Id, N - 1)
+    end.

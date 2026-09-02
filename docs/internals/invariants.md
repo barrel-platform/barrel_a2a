@@ -86,10 +86,10 @@ each answers it differently, on purpose. The follow-up queue in
 `barrel_a2a_task_proc` refuses past `max_task_queue` with
 `rate_limited`, because silently dropping a client's message would
 have it believe the message was accepted. The delivery queue in
-`barrel_a2a_push_delivery` drops its oldest past `max_queue`, because
-push is at-least-once best effort and the newest state is what a
-receiver needs; a deliberate drop must not count toward
-`max_failures`. The replay queue in `barrel_a2a_remote_task` drops its
+`barrel_a2a_push_delivery` never discards: reaching `max_queue` counts
+as a delivery failure, because 4.3 promises at-least-once and the only
+honest way to bound memory under that promise is to give up on the
+receiver visibly, which `max_failures` then does. The replay queue in `barrel_a2a_remote_task` drops its
 oldest, because the task snapshot is folded from every event anyway,
 so the outcome survives. Task history is deliberately not bounded:
 it is protocol data, and the reference `a2a-sdk` also stores it whole
@@ -164,9 +164,15 @@ registry and stops a listener that already started. It reads the
 partial config back from `persistent_term`, which is why F2's repeated
 write matters for more than the listener.
 
-**F4. The task and push supervisors are linked, not supervised.** The
-server starts them from its own `init/1` (see
-`barrel_a2a_server_inst_sup` for why). It therefore traps exits and
-turns the death of either into its own `{stop, _}`, so the instance
-supervisor rebuilds the whole server rather than leaving one holding a
-dead pid.
+**F4. The processes the server owns are linked, not supervised.** The
+server starts the task and push supervisors from its own `init/1`, and a
+process-backed task store reports its writer through
+`barrel_a2a_task_store:owner/1`. It traps exits and turns the death of
+any of the three into its own `{stop, _}`, so the instance supervisor
+rebuilds the whole instance rather than leaving the server holding a
+dead pid. That matters most for the store writer, which owns the ETS
+working copy: its death destroys the data.
+
+This shape is deliberate and gets re-reported as a defect; decision
+record [0006](../decisions/0006-owned-processes-are-linked-not-supervised.md)
+has the reasoning, the lifecycle rules and the tests that cover them.

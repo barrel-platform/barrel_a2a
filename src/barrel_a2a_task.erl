@@ -27,6 +27,7 @@
     set_status/3,
     set_status/4,
     add_history/2,
+    add_history/3,
     put_artifact/3,
     with_history_length/2,
     without_artifacts/1,
@@ -127,7 +128,24 @@ set_status(Task, State, Message, Timestamp) ->
 
 -spec add_history(task(), barrel_a2a:message()) -> task().
 add_history(Task, Message) ->
-    Task#{<<"history">> => history(Task) ++ [Message]}.
+    add_history(Task, Message, unlimited).
+
+%% @doc Append to history, keeping at most `Limit' entries.
+%%
+%% `unlimited' is the default everywhere and what the reference
+%% implementation does: history is protocol data, `historyLength'
+%% truncates what a reply carries and not what is stored. A server that
+%% runs very long multi-turn tasks can set a limit, at the cost of
+%% answering `historyLength' with less than a client asked for.
+-spec add_history(task(), barrel_a2a:message(), unlimited | pos_integer()) -> task().
+add_history(Task, Message, unlimited) ->
+    Task#{<<"history">> => history(Task) ++ [Message]};
+add_history(Task, Message, Limit) when is_integer(Limit), Limit > 0 ->
+    Task#{<<"history">> => keep_last(history(Task) ++ [Message], Limit)}.
+
+%% The newest entries are the ones worth keeping.
+keep_last(L, N) when length(L) =< N -> L;
+keep_last(L, N) -> lists:nthtail(length(L) - N, L).
 
 %% @doc Store an artifact. With `Append = true' and an existing
 %% artifact of the same id, parts are concatenated.

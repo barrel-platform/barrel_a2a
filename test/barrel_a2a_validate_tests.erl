@@ -410,6 +410,9 @@ list_tasks_request_test_() ->
             })
         ),
         ?_assertEqual(ok, barrel_a2a_validate:list_tasks_request(#{<<"status">> => 2})),
+        %% Both ends of the range are in, and an absent value is fine.
+        ?_assertEqual(ok, barrel_a2a_validate:list_tasks_request(#{<<"pageSize">> => 1})),
+        ?_assertEqual(ok, barrel_a2a_validate:list_tasks_request(#{<<"pageSize">> => 100})),
         failures(fun barrel_a2a_validate:list_tasks_request/1, [
             {"not object", <<"x">>, <<>>},
             {"contextId type", #{<<"contextId">> => 1}, <<"contextId">>},
@@ -417,6 +420,11 @@ list_tasks_request_test_() ->
             {"status type", #{<<"status">> => true}, <<"status">>},
             {"pageSize", #{<<"pageSize">> => -5}, <<"pageSize">>},
             {"pageSize type", #{<<"pageSize">> => <<"5">>}, <<"pageSize">>},
+            %% The specification fixes the range at 1 to 100, so an
+            %% explicit value outside it is a bad request rather than
+            %% something to clamp.
+            {"pageSize zero", #{<<"pageSize">> => 0}, <<"pageSize">>},
+            {"pageSize above max", #{<<"pageSize">> => 101}, <<"pageSize">>},
             {"pageToken", #{<<"pageToken">> => 1}, <<"pageToken">>},
             {"historyLength", #{<<"historyLength">> => 1.5}, <<"historyLength">>},
             {"statusTimestampAfter format", #{<<"statusTimestampAfter">> => <<"now">>},
@@ -535,6 +543,20 @@ list_push_configs_request_test_() ->
                 <<"pageToken">> => <<"p">>,
                 <<"tenant">> => <<"x">>
             })
+        ),
+        %% The 1..100 range belongs to ListTasks alone. The
+        %% specification states no bounds for this operation, so a size
+        %% ListTasks would refuse is fine here. These two validators
+        %% look alike; they are not the same.
+        ?_assertEqual(
+            ok,
+            barrel_a2a_validate:list_push_configs_request(#{
+                <<"taskId">> => <<"t">>, <<"pageSize">> => 101
+            })
+        ),
+        ?_assertMatch(
+            {error, {invalid, <<"pageSize">>, _}},
+            barrel_a2a_validate:list_tasks_request(#{<<"pageSize">> => 101})
         ),
         failures(fun barrel_a2a_validate:list_push_configs_request/1, [
             {"not object", 1, <<>>},

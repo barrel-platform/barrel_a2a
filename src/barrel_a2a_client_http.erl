@@ -11,8 +11,9 @@
 %%% owner and closes the socket when the owner dies.
 %%%
 %%% Transport options (`transport_opts' of `barrel_a2a_client'):
-%%% `timeout', `ssl_options' (hackney `ssl_options'), `proxy' and
-%%% `hackney_options' (extra hackney options).
+%%% `timeout', `ssl_options' (hackney `ssl_options'), `proxy',
+%%% `hackney_options' (extra hackney options) and `max_body' (bytes a
+%%% reply or Agent Card may occupy, default 16 MB).
 %%%
 %%% == State ==
 %%%
@@ -54,7 +55,8 @@
     timeout := timeout(),
     ssl_options => list(),
     hackney_options => list(),
-    proxy => term()
+    proxy => term(),
+    max_body => pos_integer()
 }.
 
 -export_type([conn/0]).
@@ -75,7 +77,9 @@ connect(#{<<"url">> := Url0, <<"protocolBinding">> := Binding}, Opts) when is_bi
                 binding => Binding,
                 timeout => maps:get(timeout, Opts, ?DEFAULT_TIMEOUT)
             },
-            Conn = maps:merge(Conn0, maps:with([ssl_options, hackney_options, proxy], Opts)),
+            Conn = maps:merge(
+                Conn0, maps:with([ssl_options, hackney_options, proxy, max_body], Opts)
+            ),
             {ok, Conn};
         false ->
             {error, barrel_a2a_error:new(invalid_params, [<<"Invalid interface URL: ">>, Url])}
@@ -107,16 +111,24 @@ close(_Conn) -> ok.
 call(Conn, Op, Request, Opts) ->
     {Method, Url, Headers, Body} = build(Conn, Op, Request, Opts, unary),
     Timeout = maps:get(timeout, Opts, maps:get(timeout, Conn, ?DEFAULT_TIMEOUT)),
-    HOpts = [with_body, {recv_timeout, Timeout}, {connect_timeout, Timeout} | hackney_opts(Conn)],
-    case request(Method, Url, Headers, Body, HOpts) of
+    HOpts = [{recv_timeout, Timeout}, {connect_timeout, Timeout} | hackney_opts(Conn)],
+    case request(Method, Url, Headers, Body, HOpts, {max_body(Conn), Timeout}) of
         {ok, Status, _RespHeaders, RespBody} ->
             reply(binding(Conn), Status, decode(RespBody));
         {error, Reason} ->
             {error, transport_error(Reason)}
     end.
 
-request(Method, Url, Headers, Body, HOpts) ->
-    try hackney:request(Method, Url, Headers, Body, HOpts) of
+%% Unary requests go through hackney's async API rather than its
+%% synchronous one, purely so the body can be bounded: hackney 4.7
+%% ignores `with_body' and always returns the whole body, and its
+%% `max_body_size' option covers HTTP/3 only. A hostile or broken agent
+%% would otherwise hand a client an unbounded reply, and an Agent Card
+%% is fetched before anything about the peer is known.
+request(Method, Url, Headers, Body, HOpts, {MaxBody, Timeout}) ->
+    try hackney:request(Method, Url, Headers, Body, [async | HOpts]) of
+        {ok, Ref} ->
+            collect(Ref, MaxBody, Timeout, undefined, [], <<>>);
         {ok, Status, RespHeaders, RespBody} when is_binary(RespBody) ->
             {ok, Status, RespHeaders, RespBody};
         {ok, Status, RespHeaders} ->
@@ -125,6 +137,37 @@ request(Method, Url, Headers, Body, HOpts) ->
             {error, Reason}
     catch
         Class:Reason -> {error, {Class, Reason}}
+    end.
+
+max_body(Opts) -> maps:get(max_body, Opts, ?MAX_BODY).
+
+collect(Ref, Max, Timeout, Status, Headers, Acc) ->
+    receive
+        {hackney_response, Ref, {status, S, _}} ->
+            collect(Ref, Max, Timeout, S, Headers, Acc);
+        {hackney_response, Ref, {headers, H}} ->
+            collect(Ref, Max, Timeout, Status, H, Acc);
+        {hackney_response, Ref, Chunk} when is_binary(Chunk) ->
+            case byte_size(Acc) + byte_size(Chunk) > Max of
+                true ->
+                    close_ref(Ref),
+                    {error, body_too_large};
+                false ->
+                    collect(Ref, Max, Timeout, Status, Headers, <<Acc/binary, Chunk/binary>>)
+            end;
+        {hackney_response, Ref, done} ->
+            {ok, Status, Headers, Acc};
+        {hackney_response, Ref, {redirect, _, _}} ->
+            collect(Ref, Max, Timeout, Status, Headers, Acc);
+        {hackney_response, Ref, {see_other, _, _}} ->
+            collect(Ref, Max, Timeout, Status, Headers, Acc);
+        {hackney_response, Ref, {error, Reason}} ->
+            {error, Reason}
+    after Timeout ->
+        %% hackney normally reports its own `recv_timeout'; this is the
+        %% backstop for a request process that stops reporting at all.
+        close_ref(Ref),
+        {error, timeout}
     end.
 
 reply(jsonrpc, Status, {ok, Decoded}) ->
@@ -325,14 +368,13 @@ fetch_card(Url, Opts) ->
             ETag -> [{<<"if-none-match">>, ETag} | Headers0]
         end,
     HOpts = [
-        with_body,
         {recv_timeout, Timeout},
         {connect_timeout, Timeout},
         {follow_redirect, true},
         {max_redirect, 3}
         | hackney_opts(TOpts)
     ],
-    case request(get, Url, Headers, <<>>, HOpts) of
+    case request(get, Url, Headers, <<>>, HOpts, {max_body(TOpts), Timeout}) of
         {ok, 304, _, _} ->
             {ok, not_modified};
         {ok, 200, RespHeaders, Body} ->
