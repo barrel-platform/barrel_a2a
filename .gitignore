@@ -11,6 +11,13 @@ examples/*/_checkouts/
 test/interop/.venv/
 test/interop/__pycache__/
 
+# JS interop deps created by `make interop-js-setup'
+test/interop/js/node_modules/
+test/interop/js/package-lock.json
+
+# Go interop binaries created by `make interop-go-setup'
+test/interop/go/bin/
+
 # Claude Code scratch
 .claude/
 

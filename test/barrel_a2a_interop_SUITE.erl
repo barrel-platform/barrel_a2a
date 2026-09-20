@@ -1,123 +1,145 @@
 %%%-------------------------------------------------------------------
-%%% @doc Python interop suite: the wire format between barrel_a2a and
-%%% the official A2A Python SDK (`a2a-sdk'), in both directions and
-%%% over both HTTP bindings.
+%%% @doc Interop suite: the wire format between barrel_a2a and the
+%%% official A2A SDKs, in both directions and over both HTTP bindings.
 %%%
-%%% Direction A runs `test/interop/client.py' against an Erlang server
-%%% hosting `barrel_a2a_test_agent'; the script prints one JSON line
-%%% per step and the cases assert on those. Direction B starts
-%%% `test/interop/server.py' (an SDK `AgentExecutor' mirroring the test
-%%% agent) and drives it with `barrel_a2a_client'.
+%%% One group per reference implementation, all running the same cases:
 %%%
-%%% Every case skips when `INTEROP_PYTHON' is unset or does not point
-%%% at an interpreter, so plain `rebar3 ct' never needs Python. Run via:
+%%% - `ref_client_*' runs that SDK's client script against an Erlang
+%%%   server hosting `barrel_a2a_test_agent'. The script prints one
+%%%   JSON line per step and the cases assert on those, so the contract
+%%%   between suite and script is the same in every language.
+%%% - `ref_server_*' starts that SDK's server script, which mirrors the
+%%%   test agent, and drives it with `barrel_a2a_client'.
 %%%
-%%%   make interop-setup        % once, creates test/interop/.venv
-%%%   make interop-python
+%%% A group skips when its toolchain is absent, so plain `rebar3 ct'
+%%% needs none of them:
+%%%
+%%%   make interop-python   % INTEROP_PYTHON, a venv interpreter
+%%%   make interop-js       % INTEROP_NODE, a node binary
+%%%   make interop-go       % INTEROP_GO_BIN, a directory of two binaries
+%%%   make interop          % all three
+%%%
+%%% Adding a fourth language is a script pair under `test/interop/',
+%%% a clause of {@link runner/1} and a Makefile target.
 %%% @end
 %%%-------------------------------------------------------------------
--module(barrel_a2a_python_interop_SUITE).
+-module(barrel_a2a_interop_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -export([
     all/0,
+    groups/0,
     init_per_suite/1,
     end_per_suite/1,
+    init_per_group/2,
+    end_per_group/2,
     init_per_testcase/2,
     end_per_testcase/2
 ]).
 
 -export([
-    python_client_jsonrpc_card/1,
-    python_client_jsonrpc_send/1,
-    python_client_jsonrpc_stream/1,
-    python_client_jsonrpc_multiturn/1,
-    python_client_jsonrpc_cancel/1,
-    python_client_jsonrpc_direct/1,
-    python_client_jsonrpc_get/1,
-    python_client_rest_card/1,
-    python_client_rest_send/1,
-    python_client_rest_stream/1,
-    python_client_rest_multiturn/1,
-    python_client_rest_cancel/1,
-    python_client_rest_direct/1,
-    python_client_rest_get/1,
-    erlang_client_against_python_server_jsonrpc_send/1,
-    erlang_client_against_python_server_jsonrpc_stream/1,
-    erlang_client_against_python_server_jsonrpc_multiturn/1,
-    erlang_client_against_python_server_jsonrpc_cancel/1,
-    erlang_client_against_python_server_jsonrpc_get/1,
-    erlang_client_against_python_server_jsonrpc_direct/1,
-    erlang_client_against_python_server_rest_send/1,
-    erlang_client_against_python_server_rest_stream/1,
-    erlang_client_against_python_server_rest_multiturn/1,
-    erlang_client_against_python_server_rest_cancel/1,
-    erlang_client_against_python_server_rest_get/1,
-    erlang_client_against_python_server_rest_direct/1
+    ref_client_jsonrpc_card/1,
+    ref_client_jsonrpc_send/1,
+    ref_client_jsonrpc_stream/1,
+    ref_client_jsonrpc_multiturn/1,
+    ref_client_jsonrpc_cancel/1,
+    ref_client_jsonrpc_direct/1,
+    ref_client_jsonrpc_get/1,
+    ref_client_rest_card/1,
+    ref_client_rest_send/1,
+    ref_client_rest_stream/1,
+    ref_client_rest_multiturn/1,
+    ref_client_rest_cancel/1,
+    ref_client_rest_direct/1,
+    ref_client_rest_get/1,
+    ref_server_jsonrpc_send/1,
+    ref_server_jsonrpc_stream/1,
+    ref_server_jsonrpc_multiturn/1,
+    ref_server_jsonrpc_cancel/1,
+    ref_server_jsonrpc_get/1,
+    ref_server_jsonrpc_direct/1,
+    ref_server_rest_send/1,
+    ref_server_rest_stream/1,
+    ref_server_rest_multiturn/1,
+    ref_server_rest_cancel/1,
+    ref_server_rest_get/1,
+    ref_server_rest_direct/1
 ]).
 
 -define(CLIENT_TIMEOUT, 60000).
--define(READY_TIMEOUT, 20000).
+-define(READY_TIMEOUT, 30000).
+
+-define(LANGUAGES, [python, js, go]).
 
 all() ->
+    [{group, L} || L <- ?LANGUAGES].
+
+groups() ->
+    [{L, [], cases()} || L <- ?LANGUAGES].
+
+cases() ->
     [
-        python_client_jsonrpc_card,
-        python_client_jsonrpc_send,
-        python_client_jsonrpc_stream,
-        python_client_jsonrpc_multiturn,
-        python_client_jsonrpc_cancel,
-        python_client_jsonrpc_direct,
-        python_client_jsonrpc_get,
-        python_client_rest_card,
-        python_client_rest_send,
-        python_client_rest_stream,
-        python_client_rest_multiturn,
-        python_client_rest_cancel,
-        python_client_rest_direct,
-        python_client_rest_get,
-        erlang_client_against_python_server_jsonrpc_send,
-        erlang_client_against_python_server_jsonrpc_stream,
-        erlang_client_against_python_server_jsonrpc_multiturn,
-        erlang_client_against_python_server_jsonrpc_cancel,
-        erlang_client_against_python_server_jsonrpc_get,
-        erlang_client_against_python_server_jsonrpc_direct,
-        erlang_client_against_python_server_rest_send,
-        erlang_client_against_python_server_rest_stream,
-        erlang_client_against_python_server_rest_multiturn,
-        erlang_client_against_python_server_rest_cancel,
-        erlang_client_against_python_server_rest_get,
-        erlang_client_against_python_server_rest_direct
+        ref_client_jsonrpc_card,
+        ref_client_jsonrpc_send,
+        ref_client_jsonrpc_stream,
+        ref_client_jsonrpc_multiturn,
+        ref_client_jsonrpc_cancel,
+        ref_client_jsonrpc_direct,
+        ref_client_jsonrpc_get,
+        ref_client_rest_card,
+        ref_client_rest_send,
+        ref_client_rest_stream,
+        ref_client_rest_multiturn,
+        ref_client_rest_cancel,
+        ref_client_rest_direct,
+        ref_client_rest_get,
+        ref_server_jsonrpc_send,
+        ref_server_jsonrpc_stream,
+        ref_server_jsonrpc_multiturn,
+        ref_server_jsonrpc_cancel,
+        ref_server_jsonrpc_get,
+        ref_server_jsonrpc_direct,
+        ref_server_rest_send,
+        ref_server_rest_stream,
+        ref_server_rest_multiturn,
+        ref_server_rest_cancel,
+        ref_server_rest_get,
+        ref_server_rest_direct
     ].
 
 init_per_suite(Config) ->
-    case interpreter() of
-        undefined ->
-            {skip, "INTEROP_PYTHON not set or not executable; run `make interop-python`"};
-        Python ->
-            {ok, _} = application:ensure_all_started(barrel_a2a),
-            [{python, Python} | Config]
-    end.
+    {ok, _} = application:ensure_all_started(barrel_a2a),
+    Config.
 
 end_per_suite(_Config) ->
     ok.
 
-%% Direction A cases get an Erlang server; direction B cases get a
-%% Python one. The case name carries the binding.
+init_per_group(Language, Config) ->
+    case runner(Language) of
+        {error, Why} -> {skip, Why};
+        {ok, Runner} -> [{runner, Runner} | Config]
+    end.
+
+end_per_group(_Language, _Config) ->
+    ok.
+
+%% `ref_client_*' needs an Erlang server to talk to; `ref_server_*'
+%% needs the SDK's. The case name carries the binding.
 init_per_testcase(TC, Config) ->
     case atom_to_list(TC) of
-        "python_client_" ++ _ ->
+        "ref_client_" ++ _ ->
             {ok, Server} = barrel_a2a_server:start(barrel_a2a_test_agent:card(), #{
                 handler => barrel_a2a_test_agent,
                 http => #{port => 0},
                 blocking_timeout => 10000
             }),
             [{server, Server} | Config];
-        "erlang_client_against_python_server_" ++ _ ->
+        "ref_server_" ++ _ ->
             Port = free_port(),
-            PyPort = start_python_server(?config(python, Config), Port),
-            [{py_port, PyPort}, {py_url, base_url(Port)} | Config]
+            RefPort = start_ref_server(?config(runner, Config), Port),
+            [{ref_port, RefPort}, {ref_url, base_url(Port)} | Config]
     end.
 
 end_per_testcase(_TC, Config) ->
@@ -125,9 +147,9 @@ end_per_testcase(_TC, Config) ->
         undefined -> ok;
         Server -> safe_stop(Server)
     end,
-    case ?config(py_port, Config) of
+    case ?config(ref_port, Config) of
         undefined -> ok;
-        PyPort -> stop_python_server(PyPort)
+        RefPort -> stop_ref_server(RefPort)
     end,
     ok.
 
@@ -135,8 +157,8 @@ end_per_testcase(_TC, Config) ->
 %% Direction A: Python client against the Erlang server
 %%====================================================================
 
-python_client_jsonrpc_card(Config) -> card_case(jsonrpc, Config).
-python_client_rest_card(Config) -> card_case(rest, Config).
+ref_client_jsonrpc_card(Config) -> card_case(jsonrpc, Config).
+ref_client_rest_card(Config) -> card_case(rest, Config).
 
 card_case(Binding, Config) ->
     #{<<"card">> := Card} = run_client(Binding, "card", Config),
@@ -154,19 +176,19 @@ card_case(Binding, Config) ->
         )
     ).
 
-python_client_jsonrpc_send(Config) -> send_case(jsonrpc, Config).
-python_client_rest_send(Config) -> send_case(rest, Config).
+ref_client_jsonrpc_send(Config) -> send_case(jsonrpc, Config).
+ref_client_rest_send(Config) -> send_case(rest, Config).
 
 send_case(Binding, Config) ->
     #{<<"send">> := Send} = run_client(Binding, "send", Config),
     ?assertEqual([<<"task">>], maps:get(<<"kinds">>, Send)),
     ?assertEqual(<<"TASK_STATE_COMPLETED">>, maps:get(<<"state">>, Send)),
-    ?assertEqual(<<"from python">>, maps:get(<<"artifact">>, Send)),
+    ?assertEqual(<<"interop">>, maps:get(<<"artifact">>, Send)),
     ?assert(is_binary(maps:get(<<"task_id">>, Send))),
     ?assert(is_binary(maps:get(<<"context_id">>, Send))).
 
-python_client_jsonrpc_stream(Config) -> stream_case(jsonrpc, Config).
-python_client_rest_stream(Config) -> stream_case(rest, Config).
+ref_client_jsonrpc_stream(Config) -> stream_case(jsonrpc, Config).
+ref_client_rest_stream(Config) -> stream_case(rest, Config).
 
 stream_case(Binding, Config) ->
     Steps = run_client(Binding, "stream", Config),
@@ -194,8 +216,8 @@ stream_case(Binding, Config) ->
         [S || #{<<"kind">> := <<"status_update">>, <<"state">> := S} <- Events]
     ).
 
-python_client_jsonrpc_multiturn(Config) -> multiturn_case(jsonrpc, Config).
-python_client_rest_multiturn(Config) -> multiturn_case(rest, Config).
+ref_client_jsonrpc_multiturn(Config) -> multiturn_case(jsonrpc, Config).
+ref_client_rest_multiturn(Config) -> multiturn_case(rest, Config).
 
 multiturn_case(Binding, Config) ->
     #{<<"ask">> := Ask, <<"multiturn">> := Done} = run_client(Binding, "multiturn", Config),
@@ -206,8 +228,8 @@ multiturn_case(Binding, Config) ->
     ?assertEqual(true, maps:get(<<"same_task">>, Done)),
     ?assertEqual(3, maps:get(<<"history">>, Done)).
 
-python_client_jsonrpc_cancel(Config) -> cancel_case(jsonrpc, Config).
-python_client_rest_cancel(Config) -> cancel_case(rest, Config).
+ref_client_jsonrpc_cancel(Config) -> cancel_case(jsonrpc, Config).
+ref_client_rest_cancel(Config) -> cancel_case(rest, Config).
 
 cancel_case(Binding, Config) ->
     #{<<"started">> := Started, <<"cancel">> := Cancel, <<"after_cancel">> := After} =
@@ -221,8 +243,8 @@ cancel_case(Binding, Config) ->
     ?assertEqual(maps:get(<<"task_id">>, Started), maps:get(<<"task_id">>, Cancel)),
     ?assertEqual(<<"TASK_STATE_CANCELED">>, maps:get(<<"state">>, After)).
 
-python_client_jsonrpc_direct(Config) -> direct_case(jsonrpc, Config).
-python_client_rest_direct(Config) -> direct_case(rest, Config).
+ref_client_jsonrpc_direct(Config) -> direct_case(jsonrpc, Config).
+ref_client_rest_direct(Config) -> direct_case(rest, Config).
 
 direct_case(Binding, Config) ->
     #{<<"direct">> := Direct} = run_client(Binding, "direct", Config),
@@ -230,8 +252,8 @@ direct_case(Binding, Config) ->
     ?assertEqual(<<"direct reply">>, maps:get(<<"text">>, Direct)),
     ?assertEqual(<<"ROLE_AGENT">>, maps:get(<<"role">>, Direct)).
 
-python_client_jsonrpc_get(Config) -> get_case(jsonrpc, Config).
-python_client_rest_get(Config) -> get_case(rest, Config).
+ref_client_jsonrpc_get(Config) -> get_case(jsonrpc, Config).
+ref_client_rest_get(Config) -> get_case(rest, Config).
 
 get_case(Binding, Config) ->
     #{<<"get">> := Get} = run_client(Binding, "get", Config),
@@ -243,11 +265,11 @@ get_case(Binding, Config) ->
 %% Direction B: Erlang client against the Python server
 %%====================================================================
 
-erlang_client_against_python_server_jsonrpc_send(Config) -> py_send(jsonrpc, Config).
-erlang_client_against_python_server_rest_send(Config) -> py_send(rest, Config).
+ref_server_jsonrpc_send(Config) -> ref_send(jsonrpc, Config).
+ref_server_rest_send(Config) -> ref_send(rest, Config).
 
-py_send(Binding, Config) ->
-    Agent = py_connect(Binding, Config),
+ref_send(Binding, Config) ->
+    Agent = ref_connect(Binding, Config),
     {ok, {task, Task}} = barrel_a2a_client:send(Agent, <<"echo: from erlang">>),
     ?assertEqual(completed, barrel_a2a_task:state(Task)),
     ?assertEqual(
@@ -255,11 +277,11 @@ py_send(Binding, Config) ->
     ),
     ?assert(barrel_a2a_task:context_id(Task) =/= undefined).
 
-erlang_client_against_python_server_jsonrpc_stream(Config) -> py_stream(jsonrpc, Config).
-erlang_client_against_python_server_rest_stream(Config) -> py_stream(rest, Config).
+ref_server_jsonrpc_stream(Config) -> ref_stream(jsonrpc, Config).
+ref_server_rest_stream(Config) -> ref_stream(rest, Config).
 
-py_stream(Binding, Config) ->
-    Agent = py_connect(Binding, Config),
+ref_stream(Binding, Config) ->
+    Agent = ref_connect(Binding, Config),
     {ok, RT} = barrel_a2a_client:start(Agent, <<"stream">>),
     ok = barrel_a2a_remote_task:stream_to(RT, self()),
     {Events, {done, Final}} = collect_events(RT),
@@ -277,11 +299,11 @@ py_stream(Binding, Config) ->
     ?assertEqual(completed, barrel_a2a_task:state(Final)),
     ?assertEqual(<<"part one part two">>, barrel_a2a_remote_task:text(RT)).
 
-erlang_client_against_python_server_jsonrpc_multiturn(Config) -> py_multiturn(jsonrpc, Config).
-erlang_client_against_python_server_rest_multiturn(Config) -> py_multiturn(rest, Config).
+ref_server_jsonrpc_multiturn(Config) -> ref_multiturn(jsonrpc, Config).
+ref_server_rest_multiturn(Config) -> ref_multiturn(rest, Config).
 
-py_multiturn(Binding, Config) ->
-    Agent = py_connect(Binding, Config),
+ref_multiturn(Binding, Config) ->
+    Agent = ref_connect(Binding, Config),
     {ok, {task, Task}} = barrel_a2a_client:send(Agent, <<"ask">>),
     ?assertEqual(input_required, barrel_a2a_task:state(Task)),
     ?assertEqual(<<"more?">>, barrel_a2a_message:text(barrel_a2a_task:status_message(Task))),
@@ -296,11 +318,11 @@ py_multiturn(Binding, Config) ->
         <<"thanks: second">>, barrel_a2a_artifact:text(hd(barrel_a2a_task:artifacts(Done)))
     ).
 
-erlang_client_against_python_server_jsonrpc_cancel(Config) -> py_cancel(jsonrpc, Config).
-erlang_client_against_python_server_rest_cancel(Config) -> py_cancel(rest, Config).
+ref_server_jsonrpc_cancel(Config) -> ref_cancel(jsonrpc, Config).
+ref_server_rest_cancel(Config) -> ref_cancel(rest, Config).
 
-py_cancel(Binding, Config) ->
-    Agent = py_connect(Binding, Config),
+ref_cancel(Binding, Config) ->
+    Agent = ref_connect(Binding, Config),
     {ok, RT} = barrel_a2a_client:start(Agent, <<"cancel-me">>),
     ok = barrel_a2a_remote_task:stream_to(RT, self()),
     receive
@@ -315,11 +337,11 @@ py_cancel(Binding, Config) ->
     {ok, Fetched} = barrel_a2a_client:get_task(Agent, barrel_a2a_task:id(Task)),
     ?assertEqual(canceled, barrel_a2a_task:state(Fetched)).
 
-erlang_client_against_python_server_jsonrpc_get(Config) -> py_get(jsonrpc, Config).
-erlang_client_against_python_server_rest_get(Config) -> py_get(rest, Config).
+ref_server_jsonrpc_get(Config) -> ref_get(jsonrpc, Config).
+ref_server_rest_get(Config) -> ref_get(rest, Config).
 
-py_get(Binding, Config) ->
-    Agent = py_connect(Binding, Config),
+ref_get(Binding, Config) ->
+    Agent = ref_connect(Binding, Config),
     {ok, {task, Task}} = barrel_a2a_client:send(Agent, <<"echo: x">>),
     Id = barrel_a2a_task:id(Task),
     {ok, Fetched} = barrel_a2a_client:get_task(Agent, Id),
@@ -327,11 +349,11 @@ py_get(Binding, Config) ->
     ?assertEqual(completed, barrel_a2a_task:state(Fetched)),
     ?assertEqual(<<"x">>, barrel_a2a_artifact:text(hd(barrel_a2a_task:artifacts(Fetched)))).
 
-erlang_client_against_python_server_jsonrpc_direct(Config) -> py_direct(jsonrpc, Config).
-erlang_client_against_python_server_rest_direct(Config) -> py_direct(rest, Config).
+ref_server_jsonrpc_direct(Config) -> ref_direct(jsonrpc, Config).
+ref_server_rest_direct(Config) -> ref_direct(rest, Config).
 
-py_direct(Binding, Config) ->
-    Agent = py_connect(Binding, Config),
+ref_direct(Binding, Config) ->
+    Agent = ref_connect(Binding, Config),
     {ok, {message, M}} = barrel_a2a_client:send(Agent, <<"direct">>),
     ?assertEqual(<<"direct reply">>, barrel_a2a_message:text(M)),
     ?assertEqual(agent, barrel_a2a_message:role(M)).
@@ -340,17 +362,62 @@ py_direct(Binding, Config) ->
 %% Helpers
 %%====================================================================
 
-interpreter() ->
-    case os:getenv("INTEROP_PYTHON") of
-        false ->
-            undefined;
-        "" ->
-            undefined;
-        Path ->
+%% How to launch one reference implementation's client and server.
+%% `client' is given the server URL, the binding and the scenario name;
+%% `server' is given a port and the string "both".
+-type runner() :: #{
+    name := atom(),
+    client := {file:filename(), [string()]},
+    server := {file:filename(), [string()]}
+}.
+
+-spec runner(atom()) -> {ok, runner()} | {error, string()}.
+runner(python) ->
+    case executable("INTEROP_PYTHON") of
+        undefined ->
+            {error, "INTEROP_PYTHON not set or not executable; run `make interop-python`"};
+        Exe ->
+            {ok, #{
+                name => python,
+                client => {Exe, [script("client.py")]},
+                server => {Exe, [script("server.py")]}
+            }}
+    end;
+runner(js) ->
+    case executable("INTEROP_NODE") of
+        undefined ->
+            {error, "INTEROP_NODE not set or not executable; run `make interop-js`"};
+        Exe ->
+            {ok, #{
+                name => js,
+                client => {Exe, [script("js/client.mjs")]},
+                server => {Exe, [script("js/server.mjs")]}
+            }}
+    end;
+%% Go is compiled ahead of time rather than run through `go run', which
+%% would rebuild on each of the client invocations.
+runner(go) ->
+    case os:getenv("INTEROP_GO_BIN") of
+        Dir when is_list(Dir), Dir =/= "" ->
+            Client = filename:join(Dir, "client"),
+            Server = filename:join(Dir, "server"),
+            case filelib:is_regular(Client) andalso filelib:is_regular(Server) of
+                true -> {ok, #{name => go, client => {Client, []}, server => {Server, []}}};
+                false -> {error, "INTEROP_GO_BIN holds no client/server; run `make interop-go`"}
+            end;
+        _ ->
+            {error, "INTEROP_GO_BIN not set; run `make interop-go`"}
+    end.
+
+executable(Var) ->
+    case os:getenv(Var) of
+        Path when is_list(Path), Path =/= "" ->
             case filelib:is_regular(Path) of
                 true -> Path;
                 false -> undefined
-            end
+            end;
+        _ ->
+            undefined
     end.
 
 root_dir() ->
@@ -382,14 +449,15 @@ free_port() ->
 %% `step'. A key that occurs more than once (`event') maps to the list
 %% of its objects in order.
 run_client(Binding, Scenario, Config) ->
+    #{name := Name, client := {Exe, Prefix}} = ?config(runner, Config),
     Url = binary_to_list(barrel_a2a_server:url(?config(server, Config))),
-    Args = [script("client.py"), Url, atom_to_list(Binding), Scenario],
-    {Status, Lines} = run_python(?config(python, Config), Args),
-    ct:log("client.py ~s ~s exit ~p~n~s", [Binding, Scenario, Status, Lines]),
+    Args = Prefix ++ [Url, atom_to_list(Binding), Scenario],
+    {Status, Lines} = run_exe(Exe, Args),
+    ct:log("~p client ~s ~s exit ~p~n~s", [Name, Binding, Scenario, Status, Lines]),
     Steps = parse_steps(Lines),
     case Status of
         0 -> ok;
-        _ -> ct:fail({python_client_failed, Binding, Scenario, Status, Lines})
+        _ -> ct:fail({ref_client_failed, Binding, Scenario, Status, Lines})
     end,
     ?assertMatch(#{<<"done">> := _}, Steps),
     Steps.
@@ -423,9 +491,9 @@ decode_step([${ | _] = Line) ->
 decode_step(_) ->
     error.
 
-run_python(Python, Args) ->
+run_exe(Exe, Args) ->
     Port = open_port(
-        {spawn_executable, Python},
+        {spawn_executable, Exe},
         [
             {args, Args},
             {cd, root_dir()},
@@ -449,12 +517,13 @@ collect(Port, Acc) ->
         {timeout, unicode:characters_to_list(iolist_to_binary(lists:reverse(Acc)))}
     end.
 
-%% server.py serves both bindings; wait for its READY line.
-start_python_server(Python, Port) ->
-    PyPort = open_port(
-        {spawn_executable, Python},
+%% Every reference server serves both bindings and prints `READY <port>'
+%% once it is listening; that line is the whole startup contract.
+start_ref_server(#{server := {Exe, Prefix}}, Port) ->
+    RefPort = open_port(
+        {spawn_executable, Exe},
         [
-            {args, [script("server.py"), integer_to_list(Port), "both"]},
+            {args, Prefix ++ [integer_to_list(Port), "both"]},
             {cd, root_dir()},
             exit_status,
             stderr_to_stdout,
@@ -463,38 +532,38 @@ start_python_server(Python, Port) ->
             {line, 65536}
         ]
     ),
-    wait_ready(PyPort, []),
-    PyPort.
+    wait_ready(RefPort, []),
+    RefPort.
 
-wait_ready(PyPort, Acc) ->
+wait_ready(RefPort, Acc) ->
     receive
-        {PyPort, {data, {_, <<"READY ", _/binary>>}}} ->
+        {RefPort, {data, {_, <<"READY ", _/binary>>}}} ->
             %% Keep draining the server's output so the port buffer
             %% never fills up.
-            spawn_link(fun() -> drain(PyPort) end),
+            spawn_link(fun() -> drain(RefPort) end),
             ok;
-        {PyPort, {data, {_, Line}}} ->
-            wait_ready(PyPort, [Line | Acc]);
-        {PyPort, {exit_status, Status}} ->
-            ct:fail({python_server_exited, Status, lists:reverse(Acc)})
+        {RefPort, {data, {_, Line}}} ->
+            wait_ready(RefPort, [Line | Acc]);
+        {RefPort, {exit_status, Status}} ->
+            ct:fail({ref_server_exited, Status, lists:reverse(Acc)})
     after ?READY_TIMEOUT ->
-        kill_port(PyPort),
-        ct:fail({python_server_not_ready, lists:reverse(Acc)})
+        kill_port(RefPort),
+        ct:fail({ref_server_not_ready, lists:reverse(Acc)})
     end.
 
-drain(PyPort) ->
+drain(RefPort) ->
     receive
-        {PyPort, {data, {_, Line}}} ->
-            ct:log("server.py: ~s", [Line]),
-            drain(PyPort);
-        {PyPort, {exit_status, _}} ->
+        {RefPort, {data, {_, Line}}} ->
+            ct:log("ref server: ~s", [Line]),
+            drain(RefPort);
+        {RefPort, {exit_status, _}} ->
             ok;
         stop ->
             ok
     end.
 
-stop_python_server(PyPort) ->
-    kill_port(PyPort).
+stop_ref_server(RefPort) ->
+    kill_port(RefPort).
 
 kill_port(Port) ->
     case erlang:port_info(Port, os_pid) of
@@ -517,8 +586,8 @@ safe_stop(Server) ->
         _:_ -> ok
     end.
 
-py_connect(Binding, Config) ->
-    Url = ?config(py_url, Config),
+ref_connect(Binding, Config) ->
+    Url = ?config(ref_url, Config),
     {ok, Agent} = barrel_a2a_client:connect(Url, #{prefer => [Binding], timeout => 15000}),
     Expected =
         case Binding of

@@ -115,7 +115,7 @@ async def scenario_send(base_url, binding):
     factory = make_client(base_url, binding, streaming=False)
     client = await factory.create_from_url(base_url)
     kinds, task, _ = await consume(client, SendMessageRequest(
-        message=user_message('echo: from python')
+        message=user_message('echo: interop')
     ))
     emit(step='send', kinds=kinds, state=state_name(task.status.state),
          artifact=artifact_text(task), task_id=task.id, context_id=task.context_id)
