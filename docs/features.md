@@ -33,7 +33,7 @@ in another package.
 | 4.5 security objects (every SecurityScheme variant, OAuthFlows, SecurityRequirement) | `barrel_a2a_agent_card:security_scheme/2`, `barrel_a2a_schema` | done |
 | 4.6 extensions (declaration, client opt-in, echo of the active set, required enforcement, unknown ignored, no version fallback) | `barrel_a2a_extensions`, `barrel_a2a_ctx` | done |
 | 5.1 to 5.4 binding equivalence, selection, method mapping, error mapping | both bindings share `barrel_a2a_server_core`; `barrel_a2a_error` | done |
-| 5.5 to 5.7 naming, timestamps, field presence, unknown fields ignored (`validate_schema => strict` rejects them instead), duplicate JSON keys keep the last | `barrel_a2a_json`, `barrel_a2a_validate`, `barrel_a2a_schema`, `barrel_a2a_canonical` | done; two deliberate leniencies on input, both written up at their definition: a timestamp offset other than `Z` is accepted and normalized (output is always `Z`), and task history is stored unbounded and truncated on read by `historyLength`, as the reference `a2a-sdk` does |
+| 5.5 to 5.7 naming, timestamps, field presence, `null` read as unset, unknown fields ignored (`validate_schema => strict` rejects them instead), duplicate JSON keys keep the last | `barrel_a2a_json`, `barrel_a2a_validate`, `barrel_a2a_schema`, `barrel_a2a_canonical` | done; two deliberate leniencies on input, both written up at their definition: a timestamp offset other than `Z` is accepted and normalized (output is always `Z`), and task history is stored unbounded and truncated on read by `historyLength`, as the reference `a2a-sdk` does |
 | 5.8 custom binding identification | `barrel_a2a_agent_card:select_interface/3`, client `transports` option | done |
 | 6 workflows (basic, streaming, multi-turn, version error, listing, push, file exchange, structured data) | `test/barrel_a2a_e2e_SUITE.erl` mirrors each example | done |
 | 7.1 to 7.5 authentication (TLS, verify every request, challenge info, authorization hook) | `barrel_a2a_auth`, `barrel_a2a_listener` TLS, HSTS | done |
@@ -53,9 +53,23 @@ in another package.
 | 14 media type `application/a2a+json`, headers, well-known URI | `barrel_a2a_http_engine`, `barrel_a2a` | done |
 | Multi-tenancy topic (request tenant must equal the interface tenant; `/{tenant}/` REST routes) | `barrel_a2a_tenant`, `barrel_a2a_http_engine`, `barrel_a2a_client` | done |
 
+## Deliberate deviations
+
+Four behaviours differ from a literal reading of the specification, each
+on purpose. They are listed here so a review can check the reasoning
+rather than rediscover the behaviour.
+
+| Behaviour | Why | Where the reasoning lives |
+|---|---|---|
+| A timestamp offset other than `Z` is accepted on input | Output is always `Z`. An offset denotes exactly one instant, so refusing one rejects a request no reader could misunderstand. The same lenient-on-input rule as ignoring an undeclared field. | `src/barrel_a2a_time.erl`, `from_iso/1` |
+| Task history is stored whole; `historyLength` truncates only the reply | What the reference `a2a-sdk` does. Capping storage would lose data a client may legitimately ask for. Set `max_history` to cap it. | `src/barrel_a2a_task.erl`, `add_history/3` |
+| The task and push supervisors and the store writer are linked, not supervisor children | A child must not ask its parent for a sibling while the parent is still starting it; that was a real deadlock. Every death is trapped and stops the server, so the instance supervisor rebuilds it. | [ADR 0006](decisions/0006-owned-processes-are-linked-not-supervised.md), invariant F4 |
+| A finite `blocking_timeout` answers with a non-final task | Not the default: `infinity` is, which is what the specification requires. A number is an operational deviation an operator opts into. | `guides/server.md`, `src/barrel_a2a_server.erl` |
+
 ## Notes
 
-- The task registry is in-memory (ETS) and snapshots expire after
-  `task_ttl`. A persistent store is not part of this release.
+- Task snapshots expire after `task_ttl`. The registry is in-memory
+  (ETS) by default; `task_store` swaps in the DETS backend to keep
+  tasks across restarts.
 - Client credentials are obtained out of band (7.3); the client only
   attaches them to requests.

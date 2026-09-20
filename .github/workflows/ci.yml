@@ -92,6 +92,38 @@ jobs:
       - name: Run the a2a-sdk interop suite
         run: make interop-python
 
+  interop-js:
+    name: JS interop / OTP 28
+    needs: compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.27'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run the a2a-js interop suite
+        run: make interop-js
+
+  interop-go:
+    name: Go interop / OTP 28
+    needs: compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.27'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Run the a2a-go interop suite
+        run: make interop-go
+
   format:
     name: Format check
     needs: compile

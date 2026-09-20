@@ -25,7 +25,7 @@ cp /tmp/jss/LICENSE test/json_schema_suite/LICENSE
 rm -rf test/json_schema_suite/tests/optional
 ```
 
-Then run `rebar3 ct --suite=test/barrel_mcp_json_schema_SUITE` and deal
+Then run `rebar3 ct --suite=test/barrel_a2a_json_schema_SUITE` and deal
 with whatever it says. New failures are either a bug in the validator or
 a rule we have decided not to implement; the second needs a line in the
 suite's skip list with a reason, not a silent pass.

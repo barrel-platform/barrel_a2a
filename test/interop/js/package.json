@@ -1,0 +1,10 @@
+{
+  "name": "barrel-a2a-interop-js",
+  "private": true,
+  "type": "module",
+  "description": "Reference A2A implementation driven by barrel_a2a_interop_SUITE",
+  "dependencies": {
+    "@a2a-js/sdk": "1.2.0",
+    "express": "^5.1.0"
+  }
+}

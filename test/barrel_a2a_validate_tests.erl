@@ -628,3 +628,16 @@ to_error_test_() ->
             )
         end)
     ].
+
+%% ProtoJSON: "null is accepted and treated as the default value of the
+%% corresponding field type". Real serializers emit it for an unset
+%% optional field, so a null must read as absent rather than as a bad
+%% value. Stripped in barrel_a2a_server_core before validation.
+null_is_not_a_value_test_() ->
+    [
+        ?_assertMatch(
+            {error, {invalid, <<"pageSize">>, _}},
+            barrel_a2a_validate:list_tasks_request(#{<<"pageSize">> => null})
+        ),
+        ?_assertEqual(ok, barrel_a2a_validate:list_tasks_request(#{}))
+    ].

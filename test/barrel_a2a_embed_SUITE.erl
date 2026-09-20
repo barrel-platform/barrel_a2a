@@ -31,7 +31,8 @@ all() ->
         losing_the_task_supervisor_stops_the_server,
         losing_the_task_store_writer_stops_the_server,
         disconnect_ends_blocking_send,
-        streamed_events_are_validated
+        streamed_events_are_validated,
+        null_field_reads_as_unset
     ].
 
 init_per_suite(Config) ->
@@ -633,3 +634,19 @@ streamed_events_are_validated(_Config) ->
     after
         barrel_a2a_server:stop(Server)
     end.
+
+%% The same rule end to end: a null field reaches the core and is read
+%% as unset, not as a value the validator should refuse.
+null_field_reads_as_unset(Config) ->
+    Server = ?config(server, Config),
+    Ctx = #{
+        binding => grpc,
+        headers => [{<<"a2a-version">>, <<"1.0">>}],
+        version => <<"1.0">>,
+        extensions => [],
+        principal => <<"embedder">>
+    },
+    ?assertMatch(
+        {ok, #{<<"tasks">> := _}},
+        barrel_a2a_server_core:call(Server, list_tasks, #{<<"pageSize">> => null}, Ctx)
+    ).
