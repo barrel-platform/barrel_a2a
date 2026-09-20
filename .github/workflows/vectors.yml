@@ -1,0 +1,19 @@
+name: Vendored vectors
+
+# Does the vendored A2A schema and proto still match what upstream
+# publishes? Deliberately separate from CI: this is the one check that
+# can fail because of something outside the commit, so it must never
+# gate a pull request.
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  check-vectors:
+    name: Check vendored vectors against upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare against the published schema and proto
+        run: make check-vectors

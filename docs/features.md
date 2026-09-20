@@ -53,9 +53,23 @@ in another package.
 | 14 media type `application/a2a+json`, headers, well-known URI | `barrel_a2a_http_engine`, `barrel_a2a` | done |
 | Multi-tenancy topic (request tenant must equal the interface tenant; `/{tenant}/` REST routes) | `barrel_a2a_tenant`, `barrel_a2a_http_engine`, `barrel_a2a_client` | done |
 
+## Deliberate deviations
+
+Four behaviours differ from a literal reading of the specification, each
+on purpose. They are listed here so a review can check the reasoning
+rather than rediscover the behaviour.
+
+| Behaviour | Why | Where the reasoning lives |
+|---|---|---|
+| A timestamp offset other than `Z` is accepted on input | Output is always `Z`. An offset denotes exactly one instant, so refusing one rejects a request no reader could misunderstand. The same lenient-on-input rule as ignoring an undeclared field. | `src/barrel_a2a_time.erl`, `from_iso/1` |
+| Task history is stored whole; `historyLength` truncates only the reply | What the reference `a2a-sdk` does. Capping storage would lose data a client may legitimately ask for. Set `max_history` to cap it. | `src/barrel_a2a_task.erl`, `add_history/3` |
+| The task and push supervisors and the store writer are linked, not supervisor children | A child must not ask its parent for a sibling while the parent is still starting it; that was a real deadlock. Every death is trapped and stops the server, so the instance supervisor rebuilds it. | [ADR 0006](decisions/0006-owned-processes-are-linked-not-supervised.md), invariant F4 |
+| A finite `blocking_timeout` answers with a non-final task | Not the default: `infinity` is, which is what the specification requires. A number is an operational deviation an operator opts into. | `guides/server.md`, `src/barrel_a2a_server.erl` |
+
 ## Notes
 
-- The task registry is in-memory (ETS) and snapshots expire after
-  `task_ttl`. A persistent store is not part of this release.
+- Task snapshots expire after `task_ttl`. The registry is in-memory
+  (ETS) by default; `task_store` swaps in the DETS backend to keep
+  tasks across restarts.
 - Client credentials are obtained out of band (7.3); the client only
   attaches them to requests.

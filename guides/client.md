@@ -28,7 +28,8 @@ selects an interface, and opens the transport. Options: `prefer`
 `extensions`, `timeout`, `retries` and `retry_backoff_ms` for
 idempotent operations, `validate_schema` (check replies, default
 `false`), `card_path`, `transport_opts` (`ssl_options`, `proxy`,
-`hackney_options`).
+`hackney_options`, and `max_body`, the bytes a reply or Agent Card may
+occupy, default 16 MB).
 
 If you already have a card, skip discovery:
 
@@ -99,6 +100,12 @@ ok = barrel_a2a_remote_task:send(RT, <<"more input">>),      %% follow-up on inp
 {ok, Canceled} = barrel_a2a_remote_task:cancel(RT),
 ok = barrel_a2a_remote_task:stop(RT).
 ```
+
+`start/3` also takes `max_listener_queue` (default 1000): the events a
+`stream_to/2` listener may leave unread before the handle drops it, sends
+it one `{a2a_error, RT, Error}` and stops. A listener that stops reading
+without dying would otherwise grow the node one event at a time; its
+process is never killed, since you own it.
 
 See [Streaming](streaming.md) for the event messages.
 

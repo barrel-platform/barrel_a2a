@@ -1,7 +1,7 @@
 # JSON Schema 2020-12 metaschema
 
 The dialect's own schema documents, vendored so that validating a
-schema never becomes a network request. `barrel_mcp_jsonschema`
+schema never becomes a network request. `barrel_a2a_jsonschema`
 registers each under the `$id` it declares.
 
 Fetched from https://json-schema.org/draft/2020-12/ on 2026-08-26.
@@ -33,5 +33,5 @@ case the suite keeps in `optional/` and we do not claim.
 
 There is no reason to, short of a new dialect. If you do, re-fetch
 each URI, replace the hashes above, and run
-`rebar3 ct --suite=test/barrel_mcp_json_schema_SUITE`: the official
+`rebar3 ct --suite=test/barrel_a2a_json_schema_SUITE`: the official
 suite exercises these documents through the `$ref`s that reach them.

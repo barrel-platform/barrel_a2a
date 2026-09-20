@@ -134,6 +134,16 @@ Options:
 - `task_ttl` ms (default 3600000): how long finished task snapshots stay readable.
 - `task_store`: `{Module, Opts}` implementing `barrel_a2a_task_store`. Default `{barrel_a2a_task_store_ets, #{}}` (in memory). `{barrel_a2a_task_store_dets, #{file => "tasks.dets"}}` keeps tasks across restarts; see below.
 - `history_default`: `all` or an integer applied when a request has no `historyLength`.
+- `max_history`: `unlimited` (default) stores every message of a task and lets
+  `historyLength` truncate only the reply, which is what the reference SDK does.
+  A positive integer caps what is stored, dropping the oldest, for a server
+  running very long multi-turn tasks.
+- `max_task_queue` (default 100): follow-up messages that may wait while a
+  handler runs on one task. Past it a send answers `rate_limited` rather than
+  queueing without limit.
+- `max_subscriber_queue` (default 1000): events a stream subscriber may leave
+  unread before its stream is ended. A client that stops reading without
+  disconnecting cannot otherwise be told apart from a slow one.
 - `hsts` (default `true` with TLS), `rate_limit => fun((ReqCtx) -> ok | {error, RetryAfterSeconds})`.
 - `keepalive_ms`: SSE keepalive interval, default 15000.
 
