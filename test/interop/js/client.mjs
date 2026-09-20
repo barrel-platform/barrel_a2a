@@ -80,6 +80,31 @@ async function consume(client, request) {
   return { kinds: ['message'], task: null, message: payload };
 }
 
+const PUSH_URL = 'https://example.com/hook';
+
+// The card as served, without going through the client: the SDK's
+// card accessor asks for the *extended* card when one is advertised,
+// which is a different operation with different access rules.
+async function fetchCard(baseUrl) {
+  const res = await fetch(new URL('/.well-known/agent-card.json', baseUrl));
+  if (!res.ok) throw new Error(`card: HTTP ${res.status}`);
+  return res.json();
+}
+
+// The SDK serialises an unset optional field rather than omitting it:
+// an absent status becomes "UNRECOGNIZED". Spell out the proto
+// defaults so its own guards drop them. pageSize is left out on
+// purpose: an explicit 0 is outside the range the specification gives,
+// and an absent one arrives as null, which means unset.
+const listTasksRequest = (overrides) => ({
+  tenant: '',
+  contextId: '',
+  status: 0,
+  pageToken: '',
+  includeArtifacts: false,
+  ...overrides,
+});
+
 const FINAL = new Set([
   TaskState.TASK_STATE_COMPLETED,
   TaskState.TASK_STATE_FAILED,
@@ -89,8 +114,8 @@ const FINAL = new Set([
 
 const scenarios = {
   async card(baseUrl, binding) {
-    const client = await makeClient(baseUrl, binding);
-    const card = await client.getAgentCard();
+    await makeClient(baseUrl, binding);
+    const card = await fetchCard(baseUrl);
     emit({
       step: 'card',
       name: card.name,
@@ -186,6 +211,83 @@ const scenarios = {
     emit({ step: 'cancel', state: stateName(canceled.status.state), task_id: canceled.id });
     const fetched = await client.getTask({ id: task.id });
     emit({ step: 'after_cancel', state: stateName(fetched.status.state) });
+  },
+
+  async list_tasks(baseUrl, binding) {
+    const client = await makeClient(baseUrl, binding);
+    for (const text of ['echo: one', 'echo: two']) {
+      await consume(client, { message: userMessage(text) });
+    }
+    const listed = await client.listTasks(listTasksRequest({}));
+    emit({ step: 'list', total: listed.totalSize ?? 0, count: (listed.tasks ?? []).length });
+    const page = await client.listTasks(listTasksRequest({ pageSize: 1 }));
+    emit({
+      step: 'page',
+      count: (page.tasks ?? []).length,
+      next: page.nextPageToken ?? '',
+    });
+  },
+
+  async push_config(baseUrl, binding) {
+    const client = await makeClient(baseUrl, binding);
+    const { task } = await consume(client, { message: userMessage('echo: push') });
+    const created = await client.createTaskPushNotificationConfig({
+      taskId: task.id,
+      url: PUSH_URL,
+    });
+    emit({ step: 'created', id: created.id, url: created.url });
+    const fetched = await client.getTaskPushNotificationConfig({
+      taskId: task.id,
+      id: created.id,
+    });
+    emit({ step: 'fetched', id: fetched.id });
+    const listed = await client.listTaskPushNotificationConfig({ taskId: task.id });
+    emit({ step: 'listed', count: (listed.configs ?? []).length });
+    await client.deleteTaskPushNotificationConfig({ taskId: task.id, id: created.id });
+    const after = await client.listTaskPushNotificationConfig({ taskId: task.id });
+    emit({ step: 'after_delete', count: (after.configs ?? []).length });
+  },
+
+  async resubscribe(baseUrl, binding) {
+    // The task is started with a plain send so it comes back while
+    // still running; resubscribing is then attaching to it.
+    const client = await makeClient(baseUrl, binding);
+    const { task } = await consume(client, {
+      message: userMessage('slow 3000'),
+      configuration: { returnImmediately: true },
+    });
+    emit({ step: 'started', state: stateName(task.status.state), task_id: task.id });
+    let count = 0;
+    let state = stateName(task.status.state);
+    for await (const event of client.resubscribeTask({ id: task.id })) {
+      count += 1;
+      const payload = event.payload;
+      if (payload?.$case === 'statusUpdate') {
+        state = stateName(payload.value.status.state);
+      } else if (payload?.$case === 'task') {
+        state = stateName(payload.value.status.state);
+      }
+    }
+    emit({ step: 'resubscribe', events: count, state });
+  },
+
+  async extended_card(baseUrl, binding) {
+    const client = await makeClient(baseUrl, binding);
+    const card = await fetchCard(baseUrl);
+    const advertised = card.capabilities?.extendedAgentCard === true;
+    try {
+      await client.getExtendedAgentCard({});
+      emit({ step: 'extended_card', advertised, ok: true, error: '' });
+    } catch (err) {
+      // The refusal is the point: an unauthenticated caller must be
+      // told, in a shape a client that is not ours can read.
+      emit({
+        step: 'extended_card',
+        advertised,
+        ok: false,
+        error: String(err?.message ?? err) || err?.constructor?.name || 'error',
+      });
+    }
   },
 
   async direct(baseUrl, binding) {

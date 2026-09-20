@@ -18,7 +18,14 @@ from a2a.client import ClientConfig, ClientFactory
 from a2a.helpers import get_artifact_text, get_message_text, new_text_message
 from a2a.types import (
     CancelTaskRequest,
+    DeleteTaskPushNotificationConfigRequest,
+    GetExtendedAgentCardRequest,
+    GetTaskPushNotificationConfigRequest,
     GetTaskRequest,
+    ListTaskPushNotificationConfigsRequest,
+    ListTasksRequest,
+    SubscribeToTaskRequest,
+    TaskPushNotificationConfig,
     Role,
     SendMessageConfiguration,
     SendMessageRequest,
@@ -189,6 +196,89 @@ async def scenario_cancel(base_url, binding):
     await client.close()
 
 
+PUSH_URL = 'https://example.com/hook'
+
+
+async def scenario_list_tasks(base_url, binding):
+    factory = make_client(base_url, binding, streaming=False)
+    client = await factory.create_from_url(base_url)
+    for n in ('echo: one', 'echo: two'):
+        await consume(client, SendMessageRequest(message=user_message(n)))
+    listed = await client.list_tasks(ListTasksRequest())
+    emit(step='list', total=listed.total_size, count=len(listed.tasks))
+    page = await client.list_tasks(ListTasksRequest(page_size=1))
+    emit(step='page', count=len(page.tasks), next=page.next_page_token)
+    await client.close()
+
+
+async def scenario_push_config(base_url, binding):
+    factory = make_client(base_url, binding, streaming=False)
+    client = await factory.create_from_url(base_url)
+    _, task, _ = await consume(client, SendMessageRequest(
+        message=user_message('echo: push')
+    ))
+    created = await client.create_task_push_notification_config(
+        TaskPushNotificationConfig(task_id=task.id, url=PUSH_URL)
+    )
+    emit(step='created', id=created.id, url=created.url)
+    fetched = await client.get_task_push_notification_config(
+        GetTaskPushNotificationConfigRequest(task_id=task.id, id=created.id)
+    )
+    emit(step='fetched', id=fetched.id)
+    listed = await client.list_task_push_notification_configs(
+        ListTaskPushNotificationConfigsRequest(task_id=task.id)
+    )
+    emit(step='listed', count=len(listed.configs))
+    await client.delete_task_push_notification_config(
+        DeleteTaskPushNotificationConfigRequest(task_id=task.id, id=created.id)
+    )
+    after = await client.list_task_push_notification_configs(
+        ListTaskPushNotificationConfigsRequest(task_id=task.id)
+    )
+    emit(step='after_delete', count=len(after.configs))
+    await client.close()
+
+
+async def scenario_resubscribe(base_url, binding):
+    # Two clients on purpose. The task is started by a non-streaming one
+    # so the send returns while it is still running; a streaming client
+    # then attaches to it, which is what resubscription means. A
+    # streaming send would have drained the task to completion first,
+    # and the SDK refuses to resubscribe without streaming.
+    starter = await make_client(base_url, binding, streaming=False).create_from_url(base_url)
+    client = await make_client(base_url, binding, streaming=True).create_from_url(base_url)
+    _, task, _ = await consume(starter, SendMessageRequest(
+        message=user_message('slow 3000'),
+        configuration=SendMessageConfiguration(return_immediately=True),
+    ))
+    emit(step='started', state=state_name(task.status.state), task_id=task.id)
+
+    count = 0
+    state = state_name(task.status.state)
+    async for event in client.subscribe(SubscribeToTaskRequest(id=task.id)):
+        count += 1
+        kind = event_kind(event)
+        if kind == 'status_update':
+            state = state_name(event.status_update.status.state)
+        elif kind == 'task':
+            state = state_name(event.task.status.state)
+    emit(step='resubscribe', events=count, state=state)
+    await client.close()
+    await starter.close()
+
+
+async def scenario_extended_card(base_url, binding):
+    factory = make_client(base_url, binding, streaming=False)
+    client = await factory.create_from_url(base_url)
+    advertised = client._card.capabilities.extended_agent_card
+    try:
+        await client.get_extended_agent_card(GetExtendedAgentCardRequest())
+        emit(step='extended_card', advertised=advertised, ok=True, error='')
+    except Exception as exc:  # noqa: BLE001 - the refusal is the point
+        emit(step='extended_card', advertised=advertised, ok=False, error=str(exc) or type(exc).__name__)
+    await client.close()
+
+
 async def scenario_direct(base_url, binding):
     factory = make_client(base_url, binding, streaming=False)
     client = await factory.create_from_url(base_url)
@@ -215,6 +305,10 @@ async def scenario_get(base_url, binding):
 
 SCENARIOS = {
     'card': scenario_card,
+    'list_tasks': scenario_list_tasks,
+    'push_config': scenario_push_config,
+    'resubscribe': scenario_resubscribe,
+    'extended_card': scenario_extended_card,
     'send': scenario_send,
     'stream': scenario_stream,
     'multiturn': scenario_multiturn,

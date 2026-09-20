@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 
@@ -131,6 +132,7 @@ func eventKind(ev a2a.Event) string {
 
 func scenarioCard(ctx context.Context, baseURL, binding string) {
 	card := makeClient(ctx, baseURL, binding).Card()
+	_ = ctx
 	interfaces := make([]map[string]any, 0, len(card.SupportedInterfaces))
 	for _, i := range card.SupportedInterfaces {
 		interfaces = append(interfaces, map[string]any{
@@ -255,6 +257,109 @@ func scenarioGet(ctx context.Context, baseURL, binding string) {
 	})
 }
 
+const pushURL = "https://example.com/hook"
+
+// The card as served, without going through the client: an SDK card
+// accessor may ask for the extended card when one is advertised, which
+// is a different operation with different access rules.
+func fetchCard(baseURL string) map[string]any {
+	res, err := http.Get(strings.TrimSuffix(baseURL, "/") + "/.well-known/agent-card.json")
+	if err != nil {
+		fail(fmt.Errorf("fetch card: %w", err))
+	}
+	defer res.Body.Close()
+	var card map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&card); err != nil {
+		fail(fmt.Errorf("decode card: %w", err))
+	}
+	return card
+}
+
+func scenarioListTasks(ctx context.Context, baseURL, binding string) {
+	c := makeClient(ctx, baseURL, binding)
+	for _, text := range []string{"echo: one", "echo: two"} {
+		consume(ctx, c, &a2a.SendMessageRequest{Message: userMessage(text, "", "")})
+	}
+	listed, err := c.ListTasks(ctx, &a2a.ListTasksRequest{})
+	if err != nil {
+		fail(fmt.Errorf("list: %w", err))
+	}
+	emit(map[string]any{"step": "list", "total": listed.TotalSize, "count": len(listed.Tasks)})
+	page, err := c.ListTasks(ctx, &a2a.ListTasksRequest{PageSize: 1})
+	if err != nil {
+		fail(fmt.Errorf("list page: %w", err))
+	}
+	emit(map[string]any{"step": "page", "count": len(page.Tasks), "next": page.NextPageToken})
+}
+
+func scenarioPushConfig(ctx context.Context, baseURL, binding string) {
+	c := makeClient(ctx, baseURL, binding)
+	_, task, _ := consume(ctx, c, &a2a.SendMessageRequest{Message: userMessage("echo: push", "", "")})
+	created, err := c.CreateTaskPushConfig(ctx, &a2a.PushConfig{TaskID: task.ID, URL: pushURL})
+	if err != nil {
+		fail(fmt.Errorf("create push config: %w", err))
+	}
+	emit(map[string]any{"step": "created", "id": created.ID, "url": created.URL})
+	fetched, err := c.GetTaskPushConfig(ctx, &a2a.GetTaskPushConfigRequest{TaskID: task.ID, ID: created.ID})
+	if err != nil {
+		fail(fmt.Errorf("get push config: %w", err))
+	}
+	emit(map[string]any{"step": "fetched", "id": fetched.ID})
+	listed, err := c.ListTaskPushConfigs(ctx, &a2a.ListTaskPushConfigRequest{TaskID: task.ID})
+	if err != nil {
+		fail(fmt.Errorf("list push configs: %w", err))
+	}
+	emit(map[string]any{"step": "listed", "count": len(listed)})
+	if err := c.DeleteTaskPushConfig(ctx, &a2a.DeleteTaskPushConfigRequest{TaskID: task.ID, ID: created.ID}); err != nil {
+		fail(fmt.Errorf("delete push config: %w", err))
+	}
+	after, err := c.ListTaskPushConfigs(ctx, &a2a.ListTaskPushConfigRequest{TaskID: task.ID})
+	if err != nil {
+		fail(fmt.Errorf("list after delete: %w", err))
+	}
+	emit(map[string]any{"step": "after_delete", "count": len(after)})
+}
+
+func scenarioResubscribe(ctx context.Context, baseURL, binding string) {
+	c := makeClient(ctx, baseURL, binding)
+	_, task, _ := consume(ctx, c, &a2a.SendMessageRequest{
+		Message: userMessage("slow 3000", "", ""),
+		Config:  &a2a.SendMessageConfig{ReturnImmediately: true},
+	})
+	emit(map[string]any{"step": "started", "state": task.Status.State.String(), "task_id": string(task.ID)})
+	count := 0
+	state := task.Status.State.String()
+	for ev, err := range c.SubscribeToTask(ctx, &a2a.SubscribeToTaskRequest{ID: task.ID}) {
+		if err != nil {
+			fail(fmt.Errorf("resubscribe: %w", err))
+		}
+		count++
+		switch v := ev.(type) {
+		case *a2a.TaskStatusUpdateEvent:
+			state = v.Status.State.String()
+		case *a2a.Task:
+			state = v.Status.State.String()
+		}
+	}
+	emit(map[string]any{"step": "resubscribe", "events": count, "state": state})
+}
+
+func scenarioExtendedCard(ctx context.Context, baseURL, binding string) {
+	c := makeClient(ctx, baseURL, binding)
+	card := fetchCard(baseURL)
+	advertised := false
+	if caps, ok := card["capabilities"].(map[string]any); ok {
+		advertised, _ = caps["extendedAgentCard"].(bool)
+	}
+	if _, err := c.GetExtendedAgentCard(ctx, &a2a.GetExtendedAgentCardRequest{}); err != nil {
+		// The refusal is the point: an unauthenticated caller must be
+		// told, in a shape a client that is not ours can read.
+		emit(map[string]any{"step": "extended_card", "advertised": advertised, "ok": false, "error": err.Error()})
+		return
+	}
+	emit(map[string]any{"step": "extended_card", "advertised": advertised, "ok": true, "error": ""})
+}
+
 func main() {
 	args := os.Args[1:]
 	if len(args) < 3 {
@@ -268,13 +373,17 @@ func main() {
 	}
 
 	scenarios := map[string]func(context.Context, string, string){
-		"card":      scenarioCard,
-		"send":      scenarioSend,
-		"stream":    scenarioStream,
-		"multiturn": scenarioMultiturn,
-		"cancel":    scenarioCancel,
-		"direct":    scenarioDirect,
-		"get":       scenarioGet,
+		"card":          scenarioCard,
+		"send":          scenarioSend,
+		"stream":        scenarioStream,
+		"multiturn":     scenarioMultiturn,
+		"cancel":        scenarioCancel,
+		"direct":        scenarioDirect,
+		"get":           scenarioGet,
+		"list_tasks":    scenarioListTasks,
+		"push_config":   scenarioPushConfig,
+		"resubscribe":   scenarioResubscribe,
+		"extended_card": scenarioExtendedCard,
 	}
 	run, ok := scenarios[scenario]
 	if !ok {

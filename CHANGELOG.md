@@ -41,6 +41,14 @@ Four of the changes are visible to a running deployment; see below.
   its configuration through `max_failures` rather than silently missing
   notifications.
 
+### Fixed
+
+- A request field sent as JSON `null` is treated as unset, which is
+  what ProtoJSON requires ("null is accepted and treated as the default
+  value"). It was rejected as a malformed value. Found by the
+  JavaScript SDK, whose serializer emits `"pageSize": null` for an
+  unset page size.
+
 ### Resource bounds
 
 - Every buffer a peer can fill is bounded with a stated policy: task

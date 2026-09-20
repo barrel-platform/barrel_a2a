@@ -54,6 +54,14 @@
     ref_client_rest_cancel/1,
     ref_client_rest_direct/1,
     ref_client_rest_get/1,
+    ref_client_jsonrpc_list_tasks/1,
+    ref_client_rest_list_tasks/1,
+    ref_client_jsonrpc_push_config/1,
+    ref_client_rest_push_config/1,
+    ref_client_jsonrpc_resubscribe/1,
+    ref_client_rest_resubscribe/1,
+    ref_client_jsonrpc_extended_card/1,
+    ref_client_rest_extended_card/1,
     ref_server_jsonrpc_send/1,
     ref_server_jsonrpc_stream/1,
     ref_server_jsonrpc_multiturn/1,
@@ -70,6 +78,7 @@
 
 -define(CLIENT_TIMEOUT, 60000).
 -define(READY_TIMEOUT, 30000).
+-define(PUSH_URL, <<"https://example.com/hook">>).
 
 -define(LANGUAGES, [python, js, go]).
 
@@ -95,6 +104,14 @@ cases() ->
         ref_client_rest_cancel,
         ref_client_rest_direct,
         ref_client_rest_get,
+        ref_client_jsonrpc_list_tasks,
+        ref_client_rest_list_tasks,
+        ref_client_jsonrpc_push_config,
+        ref_client_rest_push_config,
+        ref_client_jsonrpc_resubscribe,
+        ref_client_rest_resubscribe,
+        ref_client_jsonrpc_extended_card,
+        ref_client_rest_extended_card,
         ref_server_jsonrpc_send,
         ref_server_jsonrpc_stream,
         ref_server_jsonrpc_multiturn,
@@ -133,7 +150,12 @@ init_per_testcase(TC, Config) ->
             {ok, Server} = barrel_a2a_server:start(barrel_a2a_test_agent:card(), #{
                 handler => barrel_a2a_test_agent,
                 http => #{port => 0},
-                blocking_timeout => 10000
+                blocking_timeout => 10000,
+                %% The push and extended card scenarios need the
+                %% capabilities advertised. The guard is off because the
+                %% scenario registers a webhook it never calls.
+                push_notifications => #{ssrf_guard => false},
+                extended_card => barrel_a2a_test_agent:card(#{name => <<"Extended">>})
             }),
             [{server, Server} | Config];
         "ref_server_" ++ _ ->
@@ -260,6 +282,61 @@ get_case(Binding, Config) ->
     ?assertEqual(<<"TASK_STATE_COMPLETED">>, maps:get(<<"state">>, Get)),
     ?assertEqual(true, maps:get(<<"same_id">>, Get)),
     ?assertEqual(<<"x">>, maps:get(<<"artifact">>, Get)).
+
+ref_client_jsonrpc_list_tasks(Config) -> list_tasks_case(jsonrpc, Config).
+ref_client_rest_list_tasks(Config) -> list_tasks_case(rest, Config).
+
+%% ListTasks as an independent client sees it: the page is capped, the
+%% total counts everything, and a token leads to the rest.
+list_tasks_case(Binding, Config) ->
+    #{<<"list">> := List, <<"page">> := Page} = run_client(Binding, "list_tasks", Config),
+    ?assert(maps:get(<<"total">>, List) >= 2),
+    ?assert(maps:get(<<"count">>, List) >= 2),
+    ?assertEqual(1, maps:get(<<"count">>, Page)),
+    ?assertNotEqual(<<>>, maps:get(<<"next">>, Page)).
+
+ref_client_jsonrpc_push_config(Config) -> push_config_case(jsonrpc, Config).
+ref_client_rest_push_config(Config) -> push_config_case(rest, Config).
+
+%% The four push configuration operations, round trip.
+push_config_case(Binding, Config) ->
+    Steps = run_client(Binding, "push_config", Config),
+    #{<<"created">> := Created, <<"fetched">> := Fetched} = Steps,
+    #{<<"listed">> := Listed, <<"after_delete">> := After} = Steps,
+    Id = maps:get(<<"id">>, Created),
+    ?assert(is_binary(Id) andalso Id =/= <<>>),
+    ?assertEqual(?PUSH_URL, maps:get(<<"url">>, Created)),
+    ?assertEqual(Id, maps:get(<<"id">>, Fetched)),
+    ?assertEqual(1, maps:get(<<"count">>, Listed)),
+    ?assertEqual(0, maps:get(<<"count">>, After)).
+
+ref_client_jsonrpc_resubscribe(Config) -> resubscribe_case(jsonrpc, Config).
+ref_client_rest_resubscribe(Config) -> resubscribe_case(rest, Config).
+
+%% Attaching to a task that is already running: the client must still
+%% see it through to a terminal state (3.1.7).
+resubscribe_case(Binding, Config) ->
+    #{<<"started">> := Started, <<"resubscribe">> := Sub} =
+        run_client(Binding, "resubscribe", Config),
+    ?assert(
+        lists:member(maps:get(<<"state">>, Started), [
+            <<"TASK_STATE_SUBMITTED">>, <<"TASK_STATE_WORKING">>
+        ])
+    ),
+    ?assertEqual(<<"TASK_STATE_COMPLETED">>, maps:get(<<"state">>, Sub)),
+    ?assert(maps:get(<<"events">>, Sub) >= 1).
+
+ref_client_jsonrpc_extended_card(Config) -> extended_card_case(jsonrpc, Config).
+ref_client_rest_extended_card(Config) -> extended_card_case(rest, Config).
+
+%% The card advertises the capability and the server still refuses an
+%% unauthenticated caller (13.3). Checked here because the error has to
+%% be legible to a client that is not ours.
+extended_card_case(Binding, Config) ->
+    #{<<"extended_card">> := Res} = run_client(Binding, "extended_card", Config),
+    ?assertEqual(true, maps:get(<<"advertised">>, Res)),
+    ?assertEqual(false, maps:get(<<"ok">>, Res)),
+    ?assert(maps:get(<<"error">>, Res) =/= <<>>).
 
 %%====================================================================
 %% Direction B: Erlang client against the Python server

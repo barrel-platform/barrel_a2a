@@ -119,7 +119,7 @@
 call(Server, Op, Request, ReqCtx) ->
     Cfg = barrel_a2a_server:config(Server),
     try
-        Env0 = #{cfg => Cfg, op => Op, req => Request, ctx => ReqCtx},
+        Env0 = #{cfg => Cfg, op => Op, req => drop_nulls(Request), ctx => ReqCtx},
         ok = rate_limit(Env0),
         Env1 = authenticate(Env0),
         ok = tenant(Env1),
@@ -731,6 +731,19 @@ await_reply(Env, Pid, HistoryLength, Timeout) ->
         {error, Reason} ->
             fail(barrel_a2a_error:internal(Reason))
     end.
+
+%% ProtoJSON: "null is accepted and treated as the default value of the
+%% corresponding field type", so an absent field and a null one are the
+%% same request. Real serializers emit it, and a peer that sends
+%% `"pageSize": null' means "no page size", not "a bad page size".
+%%
+%% Only the top level is stripped. A field further down may be a
+%% `Struct', where null is a value the client meant to send, and
+%% `metadata' is exactly that.
+drop_nulls(Request) when is_map(Request) ->
+    maps:filter(fun(_, V) -> V =/= null end, Request);
+drop_nulls(Request) ->
+    Request.
 
 %% How this binding says "the peer is gone". A binding that cannot tell
 %% supplies nothing and a blocking wait then runs to its deadline.
