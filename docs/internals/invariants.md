@@ -72,7 +72,9 @@ with no error anywhere.
 
 **T9. The task process is the only writer of its registry row.**
 Two deliberate exceptions: the registry repairs rows when a persistent
-store opens, and the server closes the registry while task processes
+store opens (failing an unfinished row, or clearing the pid of one the
+application resumes; the resumed task's process then writes it from
+its `init/1` on), and the server closes the registry while task processes
 may still be alive, which is why the task process tolerates a closed
 table when it writes its final row.
 
@@ -94,6 +96,17 @@ oldest, because the task snapshot is folded from every event anyway,
 so the outcome survives. Task history is deliberately not bounded:
 it is protocol data, and the reference `a2a-sdk` also stores it whole
 and truncates only on read.
+
+**T12. A resumed worker is not killed at once on cancel.**
+`stop_worker/1` for a `resume` worker skips `handle_cancel/1` and
+waits up to `?CANCEL_GRACE_MS` in `await_resume_stop/3`, answering the
+worker's `ctx_cancelled` calls with `true` from inside the receive,
+since the task process is busy in `handle_call(cancel, ...)`. It ends on
+the worker's result (discarded, the task is about to be `canceled`) or
+exit, then unlinks and kills as T5 requires. Any other ctx call waits
+and is refused once the task is terminal. Handler workers keep the T4
+path. Remove the `$gen_call` clause and a resumed fun can never see a
+cancel; kill before the wait and it cannot release the work it follows.
 
 ## Engine and transport
 

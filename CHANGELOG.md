@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.1
+
+### Added
+
+- `resume` server option: `fun((Task) -> {resume, Fun} | fail)`, asked
+  on start for each unfinished task in a persistent store. `{resume,
+  Fun}` starts a task process for the task under its original id and
+  runs `Fun(Ctx)` in place of the handler; its answer completes, fails
+  or rejects the task as a handler result would, and `GetTask`,
+  `CancelTask` and streaming work as for a live task. On cancel the fun
+  sees `barrel_a2a_ctx:cancelled/1` answer `true` and has 5 seconds to
+  return. Without the option an unfinished task is failed, as before.
+  See "Resuming unfinished tasks" in `guides/server.md`.
+- `barrel_a2a_task_registry:new/2`, the registry open that takes the
+  `resume` fun.
+
 ## 0.2.0
 
 Conformance work against A2A v1.0.1, plus the maintainer documentation.

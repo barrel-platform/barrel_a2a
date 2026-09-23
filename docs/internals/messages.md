@@ -13,7 +13,7 @@ node.
 |---|---|---|---|
 | `{a2a_task_event, TaskId, StreamResponse}` | task process | every subscriber (a request process, or the push fan-out) | One protocol event: the initial `Task`, a status update, an artifact update, or a direct `Message`. Ordering is Erlang send ordering, see `invariants.md` E4 |
 | `{a2a_task_error, TaskId, Error}` | task process | subscribers | A protocol error raised by the handler before the task materialized, so it can still be answered as an error rather than a failed task |
-| `{worker_result, Ref, Result}` | handler worker | its task process | The return value of `handle_message/2`, including crashes already converted to data. `Ref` guards against a result from a killed worker |
+| `{worker_result, Ref, Result}` | handler worker | its task process | The return value of `handle_message/2`, or of a resumed task's fun, including crashes already converted to data. `Ref` guards against a result from a killed worker |
 | `linger_done` | task process | itself | The 100 ms grace after a terminal state is over; stop now |
 | `{socket_ready, Socket}` / `{socket_failed, Reason}` | acceptor | the connection process it just spawned | Ownership of the accepted socket has been transferred, or could not be |
 | `restart_acceptor` | listener | itself | An acceptor died; start a replacement after the backoff |

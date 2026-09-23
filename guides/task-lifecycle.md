@@ -42,6 +42,7 @@ terminal.
 | handler returns `{reject, M}` | `rejected` |
 | handler returns `{error, R}` or crashes | `failed` |
 | client `CancelTask` | `canceled` (after `handle_cancel/1`, worker killed) |
+| server restart, unfinished task | `failed`, or `working` when resumed |
 | follow-up message | `working` when the handler makes a ctx call, then as above |
 | `barrel_a2a_ctx:resume/1,2` | `working`, handler re-invoked |
 
@@ -102,7 +103,10 @@ work_loop(Ctx) ->
 ```
 
 `CancelTask` on a non-terminal task calls `handle_cancel/1` (module
-handlers only), kills the worker and transitions to `canceled`.
+handlers only), kills the worker and transitions to `canceled`. A
+resumed task (see below) is the exception: its fun sees
+`cancelled/1` answer `true` and has 5 seconds to return before it is
+stopped.
 Canceling an already canceled task returns the task again;
 canceling any other terminal task returns `task_not_cancelable`.
 
@@ -123,6 +127,25 @@ The task process exits shortly after a terminal state. The snapshot
 stays in the registry for `task_ttl` (default one hour) and is served
 by `GetTask` and `ListTasks`. Subscribing to a finished task fails with
 `unsupported_operation`; sending it a message fails the same way.
+
+## After a restart
+
+With the default in-memory store, tasks do not survive a restart. With
+a persistent store (`task_store`), the server reads the tasks back on
+start:
+
+- Terminal tasks keep their snapshot, served by `GetTask` and
+  `ListTasks` until `task_ttl`.
+- Without the `resume` option, every unfinished task becomes `failed`
+  with the status message "Task interrupted by a server restart". Its
+  handler died with the old node.
+- With `resume`, the server asks your fun about each unfinished task.
+  `fail` fails it as above. `{resume, Fun}` starts a task process for
+  it: the task moves to `working`, `Fun(Ctx)` runs in place of the
+  handler, and its answer drives the task as a handler result would.
+  From then on the task is a live one: it completes, fails or is
+  canceled, and clients reach it with its original id. See
+  [Resuming unfinished tasks](server.md#resuming-unfinished-tasks).
 
 ## Notes
 

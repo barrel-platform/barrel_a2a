@@ -133,6 +133,9 @@ Options:
   is not a final result.
 - `task_ttl` ms (default 3600000): how long finished task snapshots stay readable.
 - `task_store`: `{Module, Opts}` implementing `barrel_a2a_task_store`. Default `{barrel_a2a_task_store_ets, #{}}` (in memory). `{barrel_a2a_task_store_dets, #{file => "tasks.dets"}}` keeps tasks across restarts; see below.
+- `resume`: `fun((Task) -> {resume, Fun} | fail)`, asked on start for each
+  unfinished task in the store. Default: every unfinished task is failed.
+  See [Resuming unfinished tasks](#resuming-unfinished-tasks).
 - `history_default`: `all` or an integer applied when a request has no `historyLength`.
 - `max_history`: `unlimited` (default) stores every message of a task and lets
   `historyLength` truncate only the reply, which is what the reference SDK does.
@@ -167,13 +170,69 @@ Notes:
   the disk. `sync => true` makes each write wait for its flush.
   `barrel_a2a_task_store_dets:flush/1` forces a flush. One file per
   server.
-- A task that was still running when the server stopped cannot resume:
-  on open it is marked `failed` with the status message "Task interrupted
-  by a server restart". Terminal tasks keep their snapshot, artifacts and
-  history.
+- A task that was still running when the server stopped is marked
+  `failed` on open, with the status message "Task interrupted by a
+  server restart", unless the `resume` option takes it back (below).
+  Terminal tasks keep their snapshot, artifacts and history.
 - Any other backend implements the `barrel_a2a_task_store` behaviour
   (`open/1`, `put/2`, `get/2`, `delete/2`, `all/1`, `close/1`) over
   rows keyed by task id; filtering and pagination stay in the registry.
+
+## Resuming unfinished tasks
+
+Use `resume` when the work behind a task lives outside the server
+process, for example a durable job you can find again from the task id,
+so that a task running when the node stopped can still finish under its
+original id. On start the server calls your fun once per unfinished task
+in the store (not terminal: `submitted`, `working`, `input_required`,
+`auth_required`):
+
+```erlang
+{ok, Server} = barrel_a2a_server:start(Card, #{
+    handler => my_agent,
+    task_store => {barrel_a2a_task_store_dets, #{file => "/var/lib/my_agent/tasks.dets"}},
+    resume => fun(Task) ->
+        case my_jobs:find(barrel_a2a_task:id(Task)) of
+            {ok, Job} -> {resume, fun(Ctx) -> follow(Ctx, Job) end};
+            error -> fail
+        end
+    end
+}).
+
+follow(Ctx, Job) ->
+    case my_jobs:wait(Job, 500) of
+        {done, Result} -> {ok, Result};
+        {failed, Reason} -> {error, Reason};
+        timeout ->
+            case barrel_a2a_ctx:cancelled(Ctx) of
+                true -> my_jobs:cancel(Job), ok;
+                false -> follow(Ctx, Job)
+            end
+    end.
+```
+
+- `fail`, or no `resume` option, marks the task `failed` as before. A
+  fun that crashes or answers anything else fails that task only.
+- `{resume, Fun}`: the server starts a task process for the task before
+  its listener opens. The task moves to `working` if it was not, then
+  `Fun(Ctx)` runs in place of the handler and its answer is handled as a
+  handler result: `{ok, Result}` completes with `Result` as artifact,
+  `{error, R}` or a crash fails, `{reject, M}`, `{input_required, M}`
+  and the rest behave as in [Task lifecycle](task-lifecycle.md).
+- `Ctx` carries the task id, context id, the stored task
+  (`barrel_a2a_ctx:task/1`), the last user message, and the task owner
+  as principal. `status/2,3`, `artifact/2,3` and `cancelled/1` work as
+  for a handler. There is no request, so configuration, metadata and
+  extensions are empty.
+- `GetTask`, `CancelTask`, `SubscribeToTask` and follow-up messages
+  work on the original id. Follow-ups queue and go to your handler once
+  `Fun` returns.
+- On `CancelTask` the task becomes `canceled` and `Fun` gets up to 5
+  seconds to see `barrel_a2a_ctx:cancelled/1` answer `true` and return;
+  its answer is then discarded and the worker stopped. Other ctx calls
+  made during that window are refused.
+- The decision fun runs inside server start: keep it quick, and do the
+  waiting in `Fun`.
 
 ## Managing the server
 

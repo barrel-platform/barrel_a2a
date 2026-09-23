@@ -53,6 +53,11 @@
 %%% - `task_store': `{Module, Opts}' implementing `barrel_a2a_task_store'
 %%%   (default in-memory ETS; `{barrel_a2a_task_store_dets, #{file =>
 %%%   Path}}' persists tasks across restarts).
+%%% - `resume': `fun((Task) -> {resume, Fun} | fail)', asked on start
+%%%   for each unfinished task found in the store. `fail' (and the
+%%%   default, no option) marks it failed; `{resume, Fun}' starts a task
+%%%   process for it running `Fun(Ctx)', which answers as a handler
+%%%   does. It runs during server start, so keep it quick.
 %%% - `blocking_timeout': `infinity' (default) waits for a terminal or
 %%%   interrupted state, as the specification requires of a send with
 %%%   `returnImmediately' unset or false. The wait still ends as soon
@@ -265,8 +270,11 @@ url(Server) -> maps:get(url, config(Server), undefined).
 init({InstSup, #{card := Card0, opts := Opts}}) ->
     process_flag(trap_exit, true),
     try
-        Cfg0 = build_config(InstSup, Card0, Opts),
+        {Cfg0, Resumed} = build_config(InstSup, Card0, Opts),
         persistent_term:put({?MODULE, self()}, Cfg0),
+        %% Before the listener, so no request sees a resumed task
+        %% without its process.
+        ok = barrel_a2a_server_core:resume_tasks(Cfg0, Resumed),
         %% Stored again before the card is finalized so that a failure
         %% in `finalize_card/1' can still find the listener to stop.
         Cfg1 = maybe_listen(Cfg0),
@@ -383,9 +391,11 @@ build_config(InstSup, Card0, Opts) ->
             true -> Card0;
             false -> throw({invalid_option, {card, Card0}})
         end,
-    Registry =
-        case barrel_a2a_task_registry:new(task_store_opt(maps:get(task_store, Opts, undefined))) of
-            {ok, R} -> R;
+    Resume = resume_opt(maps:get(resume, Opts, undefined)),
+    StoreSpec = task_store_opt(maps:get(task_store, Opts, undefined)),
+    {Registry, Resumed} =
+        case barrel_a2a_task_registry:new(StoreSpec, Resume) of
+            {ok, R, Rs} -> {R, Rs};
             {error, Reason} -> throw({invalid_option, {task_store, Reason}})
         end,
     PushStore = barrel_a2a_push:new_store(),
@@ -437,7 +447,7 @@ build_config(InstSup, Card0, Opts) ->
             tenant => maps:get(tenant, Opts, undefined)
         }
     },
-    Cfg#{push_notify => push_notify_fun(Cfg)}.
+    {Cfg#{push_notify => push_notify_fun(Cfg)}, Resumed}.
 
 required({ok, V}, _) -> V;
 required({error, Reason}, Key) -> throw({invalid_option, {Key, Reason}}).
@@ -446,6 +456,10 @@ authorize_opt(owner) -> owner;
 authorize_opt(any) -> any;
 authorize_opt(F) when is_function(F, 2) -> F;
 authorize_opt(Other) -> throw({invalid_option, {authorize, Other}}).
+
+resume_opt(undefined) -> undefined;
+resume_opt(F) when is_function(F, 1) -> F;
+resume_opt(Other) -> throw({invalid_option, {resume, Other}}).
 
 task_store_opt(undefined) -> {barrel_a2a_task_store_ets, #{}};
 task_store_opt({Mod, O}) when is_atom(Mod), is_map(O) -> {Mod, O};
