@@ -22,7 +22,9 @@ groups() ->
         resume_fail_fails,
         resume_completes,
         resume_crash_fails_that_task,
-        resume_cancel_seen_by_fun
+        resume_cancel_seen_by_fun,
+        keep_paused_task,
+        paused_task_cannot_be_run
     ],
     [{jsonrpc, [], Cases}, {rest, [], Cases}].
 
@@ -56,6 +58,9 @@ end_per_testcase(_Case, _Config) ->
 %% Leave rows in the store as a previous run would: the task was
 %% working when the node went down.
 seed(Config, Ids) ->
+    seed(Config, Ids, working).
+
+seed(Config, Ids, State) ->
     {ok, Store} = barrel_a2a_task_registry:new(?config(store, Config)),
     lists:foreach(
         fun(Id) ->
@@ -63,7 +68,7 @@ seed(Config, Ids) ->
             Task0 = barrel_a2a_task:add_history(
                 barrel_a2a_task:new(Id, <<"ctx-1">>), Msg, unlimited
             ),
-            Task = barrel_a2a_task:set_status(Task0, working, undefined),
+            Task = barrel_a2a_task:set_status(Task0, State, undefined),
             ok = barrel_a2a_task_registry:insert(Store, #{
                 id => Id, pid => self(), task => Task, owner => anonymous
             })
@@ -184,6 +189,35 @@ resume_cancel_seen_by_fun(Config) ->
     end,
     {ok, After} = barrel_a2a_client:get_task(Agent, <<"t1">>),
     ?assertEqual(canceled, barrel_a2a_task:state(After)),
+    barrel_a2a_server:stop(Server).
+
+%% A task paused for input when the node stopped is kept paused, and the
+%% client's answer continues it through the handler.
+keep_paused_task(Config) ->
+    seed(Config, [<<"t1">>], input_required),
+    Handler = fun(Ctx, Message) ->
+        true = barrel_a2a_ctx:is_follow_up(Ctx),
+        {ok, <<"got ", (barrel_a2a_message:text(Message))/binary>>}
+    end,
+    {Server, Agent} = start(Config, #{handler => Handler, resume => fun(_) -> keep end}),
+    {ok, Paused} = barrel_a2a_client:get_task(Agent, <<"t1">>),
+    ?assertEqual(input_required, barrel_a2a_task:state(Paused)),
+    {ok, {task, Done}} = barrel_a2a_client:send(Agent, <<"blue">>, #{
+        task_id => <<"t1">>, context_id => <<"ctx-1">>
+    }),
+    ?assertEqual(completed, barrel_a2a_task:state(Done)),
+    ?assertEqual(<<"got blue">>, barrel_a2a_artifact:text(hd(barrel_a2a_task:artifacts(Done)))),
+    barrel_a2a_server:stop(Server).
+
+%% `{resume, Fun}' on a paused task would continue it without the input
+%% it waits for, so the answer is refused and the task failed.
+paused_task_cannot_be_run(Config) ->
+    seed(Config, [<<"t1">>], input_required),
+    Resume = fun(_) -> {resume, fun(_) -> {ok, <<"x">>} end} end,
+    {Server, Agent} = start(Config, #{resume => Resume}),
+    {ok, Task} = barrel_a2a_client:get_task(Agent, <<"t1">>),
+    ?assertEqual(failed, barrel_a2a_task:state(Task)),
+    ?assertEqual(<<"Task interrupted by a server restart">>, status_text(Task)),
     barrel_a2a_server:stop(Server).
 
 invalid_option(_Config) ->

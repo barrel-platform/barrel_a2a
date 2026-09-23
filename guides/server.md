@@ -133,8 +133,9 @@ Options:
   is not a final result.
 - `task_ttl` ms (default 3600000): how long finished task snapshots stay readable.
 - `task_store`: `{Module, Opts}` implementing `barrel_a2a_task_store`. Default `{barrel_a2a_task_store_ets, #{}}` (in memory). `{barrel_a2a_task_store_dets, #{file => "tasks.dets"}}` keeps tasks across restarts; see below.
-- `resume`: `fun((Task) -> {resume, Fun} | fail)`, asked on start for each
-  unfinished task in the store. Default: every unfinished task is failed.
+- `resume`: `fun((Task) -> {resume, Fun} | keep | fail)`, asked on start
+  for each unfinished task in the store. Default: every unfinished task is
+  failed.
   See [Resuming unfinished tasks](#resuming-unfinished-tasks).
 - `history_default`: `all` or an integer applied when a request has no `historyLength`.
 - `max_history`: `unlimited` (default) stores every message of a task and lets
@@ -192,9 +193,10 @@ in the store (not terminal: `submitted`, `working`, `input_required`,
     handler => my_agent,
     task_store => {barrel_a2a_task_store_dets, #{file => "/var/lib/my_agent/tasks.dets"}},
     resume => fun(Task) ->
-        case my_jobs:find(barrel_a2a_task:id(Task)) of
-            {ok, Job} -> {resume, fun(Ctx) -> follow(Ctx, Job) end};
-            error -> fail
+        case {barrel_a2a_task:state(Task), my_jobs:find(barrel_a2a_task:id(Task))} of
+            {_, error} -> fail;
+            {State, {ok, _}} when State =:= input_required; State =:= auth_required -> keep;
+            {_, {ok, Job}} -> {resume, fun(Ctx) -> follow(Ctx, Job) end}
         end
     end
 }).
@@ -213,9 +215,15 @@ follow(Ctx, Job) ->
 
 - `fail`, or no `resume` option, marks the task `failed` as before. A
   fun that crashes or answers anything else fails that task only.
-- `{resume, Fun}`: the server starts a task process for the task before
-  its listener opens. The task moves to `working` if it was not, then
-  `Fun(Ctx)` runs in place of the handler and its answer is handled as a
+- `keep`, for a paused task (`input_required`, `auth_required`) only:
+  the server starts a task process for it and it stays paused, as it
+  was before the restart. Nothing runs until the client's next message,
+  which goes to your handler as a follow-up (`barrel_a2a_ctx:task/1` is
+  the stored task). A paused task waits for its client, so it cannot
+  answer `{resume, Fun}`.
+- `{resume, Fun}`, for a `submitted` or `working` task only: the server
+  starts a task process for the task before its listener opens. The
+  task moves to `working` if it was not, then `Fun(Ctx)` runs in place of the handler and its answer is handled as a
   handler result: `{ok, Result}` completes with `Result` as artifact,
   `{error, R}` or a crash fails, `{reject, M}`, `{input_required, M}`
   and the rest behave as in [Task lifecycle](task-lifecycle.md).

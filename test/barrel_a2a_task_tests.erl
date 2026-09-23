@@ -1128,6 +1128,9 @@ drain_until_final(Id, N) ->
 %% A task process started from a stored snapshot, as the server does
 %% for a task its application resumes.
 start_resumed(Fun, State) ->
+    start_resumed(Fun, State, fun(_, _) -> {error, <<"handler must not run">>} end).
+
+start_resumed(Fun, State, Handler) ->
     Tab = barrel_a2a_task_registry:new(),
     Id = barrel_a2a_id:uuid(),
     Msg = barrel_a2a_message:new(<<"hello">>, #{message_id => <<"m1">>}),
@@ -1135,7 +1138,7 @@ start_resumed(Fun, State) ->
     Task = barrel_a2a_task:set_status(Task0, State, undefined),
     ok = barrel_a2a_task_registry:insert(Tab, #{id => Id, task => Task, owner => alice}),
     {ok, Pid} = barrel_a2a_task_proc:start_link(#{
-        cfg => #{handler => fun(_, _) -> {error, <<"handler must not run">>} end, registry => Tab},
+        cfg => #{handler => Handler, registry => Tab},
         task => Task,
         owner => alice,
         req => #{},
@@ -1172,19 +1175,42 @@ resume_completes_test_() ->
         ?assertMatch([#{<<"data">> := #{<<"x">> := 1}}], barrel_a2a_artifact:parts(A))
     end).
 
-resume_from_input_required_test_() ->
+resume_from_submitted_test_() ->
     t(fun() ->
         Fun = fun(Ctx) ->
             ok = barrel_a2a_ctx:status(Ctx, working, #{message => <<"following">>}),
             {reject, <<"no">>}
         end,
-        #{pid := Pid, id := Id} = S = start_resumed(Fun, input_required),
+        #{pid := Pid, id := Id} = S = start_resumed(Fun, submitted),
         ok = barrel_a2a_task_proc:run(Pid),
         _ = expect_status(Id, working),
         _ = expect_status(Id, working),
         _ = expect_status(Id, rejected),
         no_more_events(),
         {_, #{state := rejected}} = snapshot(S)
+    end).
+
+%% A kept task stays paused and runs nothing until its client answers;
+%% the answer then goes to the handler as a follow-up.
+resume_keep_waits_for_client_test_() ->
+    t(fun() ->
+        Test = self(),
+        Handler = fun(Ctx, M) ->
+            Test ! {handler, barrel_a2a_ctx:is_follow_up(Ctx)},
+            {ok, barrel_a2a_message:text(M)}
+        end,
+        #{pid := Pid, id := Id} = S = start_resumed(keep, input_required, Handler),
+        ok = barrel_a2a_task_proc:run(Pid),
+        no_more_events(),
+        {_, #{state := input_required}} = snapshot(S),
+        Answer = barrel_a2a_message:new(<<"blue">>, #{task_id => Id, context_id => <<"c1">>}),
+        ok = barrel_a2a_task_proc:send_message(Pid, Answer, #{}),
+        _ = expect_status(Id, working),
+        {handler, true} = recv(handler),
+        _ = expect_artifact(Id),
+        _ = expect_status(Id, completed),
+        {T, #{state := completed}} = snapshot(S),
+        ?assertEqual(<<"blue">>, barrel_a2a_artifact:text(hd(barrel_a2a_task:artifacts(T))))
     end).
 
 resume_crash_fails_task_test_() ->

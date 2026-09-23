@@ -53,11 +53,15 @@
 %%% - `task_store': `{Module, Opts}' implementing `barrel_a2a_task_store'
 %%%   (default in-memory ETS; `{barrel_a2a_task_store_dets, #{file =>
 %%%   Path}}' persists tasks across restarts).
-%%% - `resume': `fun((Task) -> {resume, Fun} | fail)', asked on start
-%%%   for each unfinished task found in the store. `fail' (and the
-%%%   default, no option) marks it failed; `{resume, Fun}' starts a task
-%%%   process for it running `Fun(Ctx)', which answers as a handler
-%%%   does. It runs during server start, so keep it quick.
+%%% - `resume': `fun((Task) -> {resume, Fun} | keep | fail)', asked on
+%%%   start for each unfinished task found in the store. `fail' (and
+%%%   the default, no option) marks it failed. A `submitted' or
+%%%   `working' task may answer `{resume, Fun}': a task process runs
+%%%   `Fun(Ctx)', which answers as a handler does. A paused task
+%%%   (`input_required', `auth_required') may answer `keep': it stays
+%%%   paused and the client's next message continues it. Any other
+%%%   answer fails the task. It runs during server start, so keep it
+%%%   quick.
 %%% - `blocking_timeout': `infinity' (default) waits for a terminal or
 %%%   interrupted state, as the specification requires of a send with
 %%%   `returnImmediately' unset or false. The wait still ends as soon

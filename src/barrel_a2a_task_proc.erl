@@ -34,7 +34,9 @@
 %%% On server start the application may resume an unfinished task
 %%% found in the store (`resume' option). The process then starts from
 %%% the stored snapshot, already materialized, and {@link run/1} runs
-%%% the application's `Fun(Ctx)' in place of the handler. Its answer is
+%%% the application's `Fun(Ctx)' in place of the handler. A paused
+%%% task the application keeps (`resume => keep') runs nothing: it
+%%% waits for the client's next message, as it did before the restart. Its answer is
 %%% handled as a handler result. On cancel its worker is not killed at
 %%% once: it gets the grace period to see `barrel_a2a_ctx:cancelled/1'
 %%% answer `true' and return (invariants.md, T12).
@@ -111,8 +113,9 @@
     %% says whether it runs the handler or a resume fun.
     worker = undefined ::
         undefined | {pid(), reference(), barrel_a2a:message(), handler | resume},
-    %% The resume fun of a resumed task, until `run' starts it.
-    resume = undefined :: undefined | fun((barrel_a2a_ctx:ctx()) -> term()),
+    %% The resume fun of a resumed task, until `run' starts it, or
+    %% `keep' for a paused task that waits for its client.
+    resume = undefined :: undefined | keep | fun((barrel_a2a_ctx:ctx()) -> term()),
     %% Follow-up messages that arrived while a worker was running.
     %% Drained one at a time, so a handler is never concurrent for one
     %% task.
@@ -141,13 +144,14 @@
         metadata => map()
     }
     %% A task resumed on server start: the stored snapshot and the fun
-    %% `run/1' calls in place of the handler.
+    %% `run/1' calls in place of the handler, or `keep' for a paused
+    %% task that waits for its client.
     | #{
         cfg := barrel_a2a_server_core:task_cfg(),
         task := barrel_a2a:task(),
         owner := barrel_a2a:principal(),
         req := barrel_a2a_server_core:task_req(),
-        resume := fun((barrel_a2a_ctx:ctx()) -> term())
+        resume := keep | fun((barrel_a2a_ctx:ctx()) -> term())
     }.
 
 -export_type([args/0]).
@@ -427,7 +431,10 @@ handle_call(_Other, _From, St) ->
     {reply, {error, unknown_call}, St}.
 
 %% @private
-handle_cast(run, #st{worker = undefined, resume = Fun} = St) when Fun =/= undefined ->
+handle_cast(run, #st{resume = keep} = St) ->
+    %% Paused: the client's next message continues it.
+    {noreply, St#st{resume = undefined}};
+handle_cast(run, #st{worker = undefined, resume = Fun} = St) when is_function(Fun, 1) ->
     St1 =
         case barrel_a2a_task:state(St#st.task) of
             working -> St;

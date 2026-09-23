@@ -640,16 +640,16 @@ create_task(#{cfg := Cfg, principal := Principal, req := Req}, ContextId, Messag
         {error, Reason} -> fail(barrel_a2a_error:internal({task_start_failed, Reason}))
     end.
 
-%% @doc Start a task process for each task the application resumed on
-%% open (see `barrel_a2a_task_registry:new/2'). Each runs its fun under
-%% the same supervisor and row rules as a new task. Called by the
-%% server before its listener starts.
--spec resume_tasks(barrel_a2a_server:cfg(), [{binary(), fun((barrel_a2a_ctx:ctx()) -> term())}]) ->
-    ok.
+%% @doc Start a task process for each task the application resumed or
+%% kept on open (see `barrel_a2a_task_registry:new/2'). A resumed one
+%% runs its fun, a kept one waits for its client; both under the same
+%% supervisor and row rules as a new task. Called by the server before
+%% its listener starts.
+-spec resume_tasks(barrel_a2a_server:cfg(), [barrel_a2a_task_registry:resumed()]) -> ok.
 resume_tasks(Cfg, Resumed) ->
-    lists:foreach(fun({TaskId, Fun}) -> resume_task(Cfg, TaskId, Fun) end, Resumed).
+    lists:foreach(fun({TaskId, How}) -> resume_task(Cfg, TaskId, How) end, Resumed).
 
-resume_task(Cfg, TaskId, Fun) ->
+resume_task(Cfg, TaskId, How) ->
     {ok, #{task := Task, owner := Owner}} =
         barrel_a2a_task_registry:lookup(maps:get(registry, Cfg), TaskId),
     Args = #{
@@ -664,7 +664,7 @@ resume_task(Cfg, TaskId, Fun) ->
             principal => Owner,
             binding => unknown
         },
-        resume => Fun
+        resume => How
     },
     case barrel_a2a_task_sup:start_task(maps:get(task_sup, Cfg), Args) of
         {ok, Pid} ->

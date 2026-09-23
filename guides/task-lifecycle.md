@@ -42,7 +42,7 @@ terminal.
 | handler returns `{reject, M}` | `rejected` |
 | handler returns `{error, R}` or crashes | `failed` |
 | client `CancelTask` | `canceled` (after `handle_cancel/1`, worker killed) |
-| server restart, unfinished task | `failed`, or `working` when resumed |
+| server restart, unfinished task | `failed`; `working` when resumed; unchanged when kept |
 | follow-up message | `working` when the handler makes a ctx call, then as above |
 | `barrel_a2a_ctx:resume/1,2` | `working`, handler re-invoked |
 
@@ -140,11 +140,14 @@ start:
   with the status message "Task interrupted by a server restart". Its
   handler died with the old node.
 - With `resume`, the server asks your fun about each unfinished task.
-  `fail` fails it as above. `{resume, Fun}` starts a task process for
-  it: the task moves to `working`, `Fun(Ctx)` runs in place of the
-  handler, and its answer drives the task as a handler result would.
-  From then on the task is a live one: it completes, fails or is
-  canceled, and clients reach it with its original id. See
+  `fail` fails it as above. For a `submitted` or `working` task,
+  `{resume, Fun}` starts a task process for it: the task moves to
+  `working`, `Fun(Ctx)` runs in place of the handler, and its answer
+  drives the task as a handler result would. For a paused task
+  (`input_required`, `auth_required`), `keep` restores it paused: the
+  client's next message continues it through your handler. Either way
+  the task is a live one again: it completes, fails or is canceled, and
+  clients reach it with its original id. See
   [Resuming unfinished tasks](server.md#resuming-unfinished-tasks).
 
 ## Notes

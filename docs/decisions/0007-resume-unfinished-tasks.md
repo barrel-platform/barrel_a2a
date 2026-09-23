@@ -15,14 +15,25 @@ on the original id never shows it.
 
 ## Decision
 
-A server option `resume => fun((Task) -> {resume, Fun} | fail)`. The
-registry asks it once per unfinished row on open. `fail`, a crash or any
-other answer fails the row as before; `{resume, Fun}` keeps the row and
-clears its pid. The server then starts an ordinary task process for each
+A server option `resume => fun((Task) -> {resume, Fun} | keep | fail)`.
+The registry asks it once per unfinished row on open. `fail`, a crash or
+any other answer fails the row as before; `{resume, Fun}` (a `submitted`
+or `working` task) or `keep` (a paused one) keeps the row and clears its
+pid. The server then starts an ordinary task process for each
 resumed task, before its listener opens. The process starts from the
 stored snapshot, already materialized, takes its row in `init/1`, moves
 the task to `working`, and runs `Fun(Ctx)` in place of the handler. Its
 answer goes through the same result path as a handler's.
+
+A paused task is different. `input_required` means the agent needs the
+client's input to proceed, so running anything without it would move
+the task to `working` against the meaning of the state. A paused task
+may therefore only be kept: its process starts in the paused state,
+runs nothing, and the client's next message goes to the handler as a
+follow-up, exactly as it would have without the restart. `auth_required`
+follows the same rule, although the specification lets authorization
+complete out of band: after a restart the application holds no ctx to
+resume it with, and the client's next message still continues it.
 
 Cancel differs in one respect: a resumed worker is not killed at once.
 It gets the cancel grace period, during which `barrel_a2a_ctx:cancelled/1`

@@ -9,7 +9,8 @@
 %%% expires. On open, rows left by a previous run whose task was still
 %%% running are marked failed: their workers are gone. With a `resume'
 %%% fun (see {@link new/2}) the application may take such a task back
-%%% instead; its row is kept and the server starts a process for it.
+%%% instead, or keep a paused one waiting for its client; its row is
+%%% kept and the server starts a process for it.
 %%%
 %%% ListTasks (3.1.4) sorts by status timestamp descending and uses an
 %%% opaque cursor `{TimestampMs, TaskId}' for pagination.
@@ -63,14 +64,17 @@
     page_token => binary() | undefined
 }.
 
-%% Asked once per unfinished row on open: `fail' (the default
-%% behaviour) or `{resume, Fun}', where `Fun(Ctx)' answers as a
-%% handler does.
+%% Asked once per unfinished row on open. Any task may answer `fail'
+%% (the default behaviour). A `submitted' or `working' task may answer
+%% `{resume, Fun}', where `Fun(Ctx)' answers as a handler does. A
+%% paused task (`input_required', `auth_required') may answer `keep':
+%% it stays paused and the client's next message continues it.
 -type resume() :: fun(
-    (barrel_a2a:task()) -> {resume, fun((barrel_a2a_ctx:ctx()) -> term())} | fail
+    (barrel_a2a:task()) -> {resume, fun((barrel_a2a_ctx:ctx()) -> term())} | keep | fail
 ).
+-type resumed() :: {binary(), fun((barrel_a2a_ctx:ctx()) -> term()) | keep}.
 
--export_type([table/0, entry/0, filter/0, resume/0]).
+-export_type([table/0, entry/0, filter/0, resume/0, resumed/0]).
 
 %% Both fixed by the specification: "If unspecified, at most 50 tasks
 %% will be returned. The minimum value is 1. The maximum value is 100."
@@ -91,16 +95,17 @@ new(Spec) ->
     end.
 
 %% @doc As {@link new/1}, asking `Resume' what to do with each
-%% unfinished row. Returns the tasks to resume with their funs.
+%% unfinished row. Returns the tasks to resume with their funs, and
+%% the paused tasks to keep.
 -spec new({module(), map()}, resume() | undefined) ->
-    {ok, table(), [{binary(), fun((barrel_a2a_ctx:ctx()) -> term())}]} | {error, term()}.
+    {ok, table(), [resumed()]} | {error, term()}.
 new(Spec, Resume) ->
     case barrel_a2a_task_store:open(Spec) of
         {ok, Store} ->
             Resumed = lists:foldl(
                 fun(Row, Acc) ->
                     case repair(Store, Row, Resume) of
-                        {resume, Id, Fun} -> [{Id, Fun} | Acc];
+                        {resume, Id, How} -> [{Id, How} | Acc];
                         ok -> Acc
                     end
                 end,
@@ -124,21 +129,25 @@ repair(Store, Map, Resume) ->
         {true, _} ->
             barrel_a2a_task_store:put(Store, to_map(Row#row{pid = undefined}));
         {false, _} ->
-            case ask_resume(Resume, Id, Task) of
-                {resume, Fun} ->
-                    barrel_a2a_task_store:put(Store, to_map(Row#row{pid = undefined})),
-                    {resume, Id, Fun};
+            case ask_resume(Resume, Id, Task, barrel_a2a_task_state:is_interrupted(State)) of
                 fail ->
-                    fail_row(Store, Row)
+                    fail_row(Store, Row);
+                How ->
+                    barrel_a2a_task_store:put(Store, to_map(Row#row{pid = undefined})),
+                    {resume, Id, How}
             end
     end.
 
-ask_resume(undefined, _Id, _Task) ->
+%% A paused task waits for its client, so it cannot be run again
+%% without one: it may only be kept, and a running one only resumed.
+ask_resume(undefined, _Id, _Task, _Paused) ->
     fail;
-ask_resume(Resume, Id, Task) ->
+ask_resume(Resume, Id, Task, Paused) ->
     try Resume(Task) of
-        {resume, Fun} when is_function(Fun, 1) ->
-            {resume, Fun};
+        {resume, Fun} when is_function(Fun, 1), not Paused ->
+            Fun;
+        keep when Paused ->
+            keep;
         fail ->
             fail;
         Other ->
