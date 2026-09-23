@@ -2,6 +2,9 @@
 
 ## 0.2.1
 
+Tasks and their webhooks can outlive a server restart when tasks are
+persisted. Nothing changes unless you set the new options.
+
 ### Added
 
 - `resume` server option: `fun((Task) -> {resume, Fun} | keep | fail)`,
@@ -12,8 +15,8 @@
   would, and `GetTask`, `CancelTask` and streaming work as for a live
   task. For a paused task (`input_required`, `auth_required`), `keep`
   restores it paused, and the client's next message continues it
-  through the handler. On cancel the fun
-  sees `barrel_a2a_ctx:cancelled/1` answer `true` and has 5 seconds to
+  through the handler. On cancel a resumed fun sees
+  `barrel_a2a_ctx:cancelled/1` answer `true` and has 5 seconds to
   return. Without the option an unfinished task is failed, as before.
   See "Resuming unfinished tasks" in `guides/server.md`.
 - `push_config_store` server option: `{Module, Opts}` implementing
@@ -21,7 +24,8 @@
   restarts, so a webhook registered before a restart is told how its
   task ends. On start, a config whose task is terminal gets the task's
   final status delivered again, and one whose task is gone is dropped.
-  Without the option configs stay in memory, as before.
+  Without the option configs stay in memory, as before. See "Across
+  restarts" in `guides/push-notifications.md`.
 - `barrel_a2a_task_registry:new/2`, the registry open that takes the
   `resume` fun; `barrel_a2a_push:open_store/3`, `close_store/1` and
   `store_owner/1`.
