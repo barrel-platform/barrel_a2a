@@ -173,15 +173,16 @@ collapse it without breaking that cycle another way.
 **F3. A failed `init/1` has to clean up after itself.** Returning
 `{stop, _}` from `init/1`, or crashing in it, does not run
 `terminate/2`. `undo/1` erases the `persistent_term` entry, closes the
-registry and stops a listener that already started. It reads the
+registry and the push config store, and stops a listener that already started. It reads the
 partial config back from `persistent_term`, which is why F2's repeated
 write matters for more than the listener.
 
 **F4. The processes the server owns are linked, not supervised.** The
 server starts the task and push supervisors from its own `init/1`, and a
 process-backed task store reports its writer through
-`barrel_a2a_task_store:owner/1`. It traps exits and turns the death of
-any of the three into its own `{stop, _}`, so the instance supervisor
+`barrel_a2a_task_store:owner/1`, as does a process-backed push config
+store (`barrel_a2a_push:store_owner/1`). It traps exits and turns the
+death of any of them into its own `{stop, _}`, so the instance supervisor
 rebuilds the whole instance rather than leaving the server holding a
 dead pid. That matters most for the store writer, which owns the ETS
 working copy: its death destroys the data.

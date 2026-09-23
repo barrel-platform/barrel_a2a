@@ -24,7 +24,9 @@ groups() ->
         resume_crash_fails_that_task,
         resume_cancel_seen_by_fun,
         keep_paused_task,
-        paused_task_cannot_be_run
+        paused_task_cannot_be_run,
+        push_config_survives_restart,
+        push_final_status_redelivered
     ],
     [{jsonrpc, [], Cases}, {rest, [], Cases}].
 
@@ -46,7 +48,11 @@ init_per_testcase(_Case, Config) ->
         ?config(priv_dir, Config),
         "tasks_" ++ integer_to_list(erlang:unique_integer([positive])) ++ ".dets"
     ),
-    [{store, {barrel_a2a_task_store_dets, #{file => File}}} | Config].
+    [
+        {store, {barrel_a2a_task_store_dets, #{file => File}}},
+        {push_store, {barrel_a2a_task_store_dets, #{file => File ++ ".push"}}}
+        | Config
+    ].
 
 end_per_testcase(_Case, _Config) ->
     ok.
@@ -220,11 +226,93 @@ paused_task_cannot_be_run(Config) ->
     ?assertEqual(<<"Task interrupted by a server restart">>, status_text(Task)),
     barrel_a2a_server:stop(Server).
 
+%% The first run: a task that is still working when the server stops,
+%% with a webhook registered on it. Returns the task id.
+first_run_with_webhook(Config, WebhookUrl) ->
+    Blocks = fun(_Ctx, _Msg) ->
+        receive
+            never -> ok
+        end
+    end,
+    {Server, Agent} = start(Config, push_opts(Config, #{handler => Blocks})),
+    {ok, {task, T}} = barrel_a2a_client:send(Agent, <<"work">>, #{return_immediately => true}),
+    Id = barrel_a2a_task:id(T),
+    {ok, _} = barrel_a2a_client:create_push_config(Agent, Id, #{url => WebhookUrl}),
+    barrel_a2a_server:stop(Server),
+    Id.
+
+push_opts(Config, Extra) ->
+    maps:merge(
+        #{
+            push_notifications => #{ssrf_guard => false, timeout => 2000, backoff => {50, 2}},
+            push_config_store => ?config(push_store, Config)
+        },
+        Extra
+    ).
+
+%% The final webhook event for `Id', skipping anything before it.
+final_webhook(Id) ->
+    receive
+        {webhook, _Headers, Body} ->
+            {ok, Ev} = barrel_a2a_json:decode(Body),
+            case barrel_a2a_event:is_final(Ev) andalso barrel_a2a_event:task_id(Ev) =:= Id of
+                true -> Ev;
+                false -> final_webhook(Id)
+            end
+    after 5000 -> ct:fail(no_final_webhook)
+    end.
+
+final_state(Ev) ->
+    #{<<"statusUpdate">> := #{<<"status">> := #{<<"state">> := S}}} = Ev,
+    S.
+
+%% A webhook registered before the restart is told how the resumed task
+%% ends.
+push_config_survives_restart(Config) ->
+    {Webhook, Port} = barrel_a2a_test_agent:webhook_server(self()),
+    try
+        Url = <<"http://127.0.0.1:", (integer_to_binary(Port))/binary, "/hook">>,
+        Id = first_run_with_webhook(Config, Url),
+        Resume = fun(_) -> {resume, fun(_) -> {ok, <<"done">>} end} end,
+        {Server, Agent} = start(Config, push_opts(Config, #{resume => Resume})),
+        ?assertEqual(<<"TASK_STATE_COMPLETED">>, final_state(final_webhook(Id))),
+        _ = poll_until(Agent, Id, completed, 100),
+        barrel_a2a_server:stop(Server)
+    after
+        barrel_a2a_test_agent:webhook_stop(Webhook)
+    end.
+
+%% Without `resume' the restart fails the task, and its webhook is told
+%% so.
+push_final_status_redelivered(Config) ->
+    {Webhook, Port} = barrel_a2a_test_agent:webhook_server(self()),
+    try
+        Url = <<"http://127.0.0.1:", (integer_to_binary(Port))/binary, "/hook">>,
+        Id = first_run_with_webhook(Config, Url),
+        {Server, Agent} = start(Config, push_opts(Config, #{})),
+        Ev = final_webhook(Id),
+        ?assertEqual(<<"TASK_STATE_FAILED">>, final_state(Ev)),
+        {ok, Task} = barrel_a2a_client:get_task(Agent, Id),
+        ?assertEqual(failed, barrel_a2a_task:state(Task)),
+        barrel_a2a_server:stop(Server)
+    after
+        barrel_a2a_test_agent:webhook_stop(Webhook)
+    end.
+
 invalid_option(_Config) ->
     Card = barrel_a2a_agent_card:new(#{name => <<"Resume">>, description => <<"resume">>}),
     ?assertEqual(
         {error, {invalid_option, {resume, 42}}},
         barrel_a2a_server:start(Card, #{
             handler => fun(_, _) -> ok end, listen => false, resume => 42
+        })
+    ),
+    ?assertEqual(
+        {error, {invalid_option, {push_config_store, 42}}},
+        barrel_a2a_server:start(Card, #{
+            handler => fun(_, _) -> ok end,
+            listen => false,
+            push_notifications => #{},
+            push_config_store => 42
         })
     ).

@@ -133,6 +133,9 @@ Options:
   is not a final result.
 - `task_ttl` ms (default 3600000): how long finished task snapshots stay readable.
 - `task_store`: `{Module, Opts}` implementing `barrel_a2a_task_store`. Default `{barrel_a2a_task_store_ets, #{}}` (in memory). `{barrel_a2a_task_store_dets, #{file => "tasks.dets"}}` keeps tasks across restarts; see below.
+- `push_config_store`: `{Module, Opts}` implementing `barrel_a2a_task_store`,
+  to keep push notification configs across restarts. Default in memory. See
+  [Push notifications](push-notifications.md#across-restarts).
 - `resume`: `fun((Task) -> {resume, Fun} | keep | fail)`, asked on start
   for each unfinished task in the store. Default: every unfinished task is
   failed.
@@ -175,6 +178,9 @@ Notes:
   `failed` on open, with the status message "Task interrupted by a
   server restart", unless the `resume` option takes it back (below).
   Terminal tasks keep their snapshot, artifacts and history.
+- Push notification configs are kept in memory unless you set
+  `push_config_store` as well; see
+  [Push notifications](push-notifications.md#across-restarts).
 - Any other backend implements the `barrel_a2a_task_store` behaviour
   (`open/1`, `put/2`, `get/2`, `delete/2`, `all/1`, `close/1`) over
   rows keyed by task id; filtering and pagination stay in the registry.

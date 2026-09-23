@@ -14,3 +14,4 @@ Format: context, decision, consequences. Keep them to a page.
 - [0005](0005-grpc-in-a-separate-package.md) The gRPC binding lives outside this package
 - [0006](0006-owned-processes-are-linked-not-supervised.md) Processes the server owns are linked, not supervisor children
 - [0007](0007-resume-unfinished-tasks.md) The application may resume an unfinished task on start
+- [0008](0008-persist-push-configs.md) Push configs persist through the task store behaviour

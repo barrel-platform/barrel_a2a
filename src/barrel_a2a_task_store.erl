@@ -9,7 +9,9 @@
 %%% `task_store => {Module, Opts}'.
 %%%
 %%% A row is a map: `#{id, pid, task, context_id, state, status_ms,
-%%% owner, finished_ms}'. Stores treat it as opaque except for `id'.
+%%% owner, finished_ms}'. Stores treat it as opaque except for `id', so
+%%% the same stores also keep push notification configs (server option
+%%% `push_config_store'), whose rows are `#{id, task_id, config}'.
 %%% Rows loaded by a store after a restart carry the pid of a process
 %%% that no longer exists; the registry repairs them on open.
 %%%
@@ -31,15 +33,17 @@
     owner := barrel_a2a:principal(),
     finished_ms := integer() | undefined
 }.
+%% What a store sees: any map keyed by `id'.
+-type entry() :: #{id := binary(), atom() => term()}.
 -type handle() :: {module(), term()}.
 
--export_type([row/0, handle/0]).
+-export_type([row/0, entry/0, handle/0]).
 
 -callback open(Opts :: map()) -> {ok, State :: term()} | {error, term()}.
--callback put(State :: term(), row()) -> ok.
--callback get(State :: term(), binary()) -> {ok, row()} | error.
+-callback put(State :: term(), entry()) -> ok.
+-callback get(State :: term(), binary()) -> {ok, entry()} | error.
 -callback delete(State :: term(), binary()) -> ok.
--callback all(State :: term()) -> [row()].
+-callback all(State :: term()) -> [entry()].
 -callback close(State :: term()) -> ok.
 
 %% The process the store depends on, if it has one. A store backed by a
@@ -56,16 +60,16 @@ open({Module, Opts}) ->
         {error, _} = E -> E
     end.
 
--spec put(handle(), row()) -> ok.
+-spec put(handle(), entry()) -> ok.
 put({M, S}, Row) -> M:put(S, Row).
 
--spec get(handle(), binary()) -> {ok, row()} | error.
+-spec get(handle(), binary()) -> {ok, entry()} | error.
 get({M, S}, Id) -> M:get(S, Id).
 
 -spec delete(handle(), binary()) -> ok.
 delete({M, S}, Id) -> M:delete(S, Id).
 
--spec all(handle()) -> [row()].
+-spec all(handle()) -> [entry()].
 all({M, S}) -> M:all(S).
 
 %% @doc The process this store depends on, or `undefined' for a store

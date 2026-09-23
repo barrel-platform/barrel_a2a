@@ -103,6 +103,35 @@ consecutive failures the config is dropped. Delivery is therefore
 ordered per webhook and at-least-once: keep your handler idempotent
 on `taskId` plus the event content.
 
+## Across restarts
+
+Configs live in memory by default, so a restart loses them and the
+webhook never hears how its task ends. When you persist tasks
+(`task_store`), persist their push configs too, with any
+`barrel_a2a_task_store`:
+
+```erlang
+{ok, Server} = barrel_a2a_server:start(Card, #{
+    handler => my_agent,
+    push_notifications => #{},
+    task_store => {barrel_a2a_task_store_dets, #{file => "/var/lib/my_agent/tasks.dets"}},
+    push_config_store => {barrel_a2a_task_store_dets, #{file => "/var/lib/my_agent/push.dets"}}
+}).
+```
+
+- Every create and delete is written through; configs are read back on
+  start, so `GetTaskPushNotificationConfig` and delivery work on the
+  same ids after a restart.
+- A config whose task is gone (expired) is dropped on start.
+- A config whose task is terminal was never cleared by its worker, so
+  its final event was not delivered: the task ended as the node went
+  down, or the restart failed it. The server sends the final
+  `statusUpdate` again on start, then the config is cleared as usual.
+- A resumed task (`resume` option, see [Server](server.md)) notifies
+  its webhooks like any live task.
+- Use a separate file from `task_store`. The option is ignored when
+  `push_notifications` is off.
+
 ## Notes
 
 - The first event delivered is the `Task` snapshot, then

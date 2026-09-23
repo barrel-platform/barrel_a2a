@@ -16,8 +16,21 @@
   sees `barrel_a2a_ctx:cancelled/1` answer `true` and has 5 seconds to
   return. Without the option an unfinished task is failed, as before.
   See "Resuming unfinished tasks" in `guides/server.md`.
+- `push_config_store` server option: `{Module, Opts}` implementing
+  `barrel_a2a_task_store` keeps push notification configs across
+  restarts, so a webhook registered before a restart is told how its
+  task ends. On start, a config whose task is terminal gets the task's
+  final status delivered again, and one whose task is gone is dropped.
+  Without the option configs stay in memory, as before.
 - `barrel_a2a_task_registry:new/2`, the registry open that takes the
-  `resume` fun.
+  `resume` fun; `barrel_a2a_push:open_store/3`, `close_store/1` and
+  `store_owner/1`.
+
+### Changed
+
+- The `barrel_a2a_task_store` callbacks take and return any map keyed
+  by `id` (type `entry()`), which is how the stores already treated
+  rows. Existing stores need no change.
 
 ## 0.2.0
 
