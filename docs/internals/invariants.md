@@ -72,7 +72,9 @@ with no error anywhere.
 
 **T9. The task process is the only writer of its registry row.**
 Two deliberate exceptions: the registry repairs rows when a persistent
-store opens, and the server closes the registry while task processes
+store opens (failing an unfinished row, or clearing the pid of one the
+application resumes; the resumed task's process then writes it from
+its `init/1` on), and the server closes the registry while task processes
 may still be alive, which is why the task process tolerates a closed
 table when it writes its final row.
 
@@ -94,6 +96,17 @@ oldest, because the task snapshot is folded from every event anyway,
 so the outcome survives. Task history is deliberately not bounded:
 it is protocol data, and the reference `a2a-sdk` also stores it whole
 and truncates only on read.
+
+**T12. A resumed worker is not killed at once on cancel.**
+`stop_worker/1` for a `resume` worker skips `handle_cancel/1` and
+waits up to `?CANCEL_GRACE_MS` in `await_resume_stop/3`, answering the
+worker's `ctx_cancelled` calls with `true` from inside the receive,
+since the task process is busy in `handle_call(cancel, ...)`. It ends on
+the worker's result (discarded, the task is about to be `canceled`) or
+exit, then unlinks and kills as T5 requires. Any other ctx call waits
+and is refused once the task is terminal. Handler workers keep the T4
+path. Remove the `$gen_call` clause and a resumed fun can never see a
+cancel; kill before the wait and it cannot release the work it follows.
 
 ## Engine and transport
 
@@ -160,15 +173,16 @@ collapse it without breaking that cycle another way.
 **F3. A failed `init/1` has to clean up after itself.** Returning
 `{stop, _}` from `init/1`, or crashing in it, does not run
 `terminate/2`. `undo/1` erases the `persistent_term` entry, closes the
-registry and stops a listener that already started. It reads the
+registry and the push config store, and stops a listener that already started. It reads the
 partial config back from `persistent_term`, which is why F2's repeated
 write matters for more than the listener.
 
 **F4. The processes the server owns are linked, not supervised.** The
 server starts the task and push supervisors from its own `init/1`, and a
 process-backed task store reports its writer through
-`barrel_a2a_task_store:owner/1`. It traps exits and turns the death of
-any of the three into its own `{stop, _}`, so the instance supervisor
+`barrel_a2a_task_store:owner/1`, as does a process-backed push config
+store (`barrel_a2a_push:store_owner/1`). It traps exits and turns the
+death of any of them into its own `{stop, _}`, so the instance supervisor
 rebuilds the whole instance rather than leaving the server holding a
 dead pid. That matters most for the store writer, which owns the ETS
 working copy: its death destroys the data.

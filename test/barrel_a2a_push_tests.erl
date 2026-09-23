@@ -462,3 +462,61 @@ take_overflow_test() ->
     _ = ets:update_counter(Store, {overflow, <<"c">>}, 3, {{overflow, <<"c">>}, 0}),
     ?assertEqual(3, barrel_a2a_push:take_overflow(Store, <<"c">>)),
     ?assertEqual(0, barrel_a2a_push:take_overflow(Store, <<"c">>)).
+
+%%--------------------------------------------------------------------
+%% Backing store
+%%--------------------------------------------------------------------
+
+backing_spec() ->
+    File = filename:join(
+        os:getenv("TMPDIR", "/tmp"),
+        "barrel_a2a_push_" ++ integer_to_list(erlang:unique_integer([positive])) ++ ".dets"
+    ),
+    {File, {barrel_a2a_task_store_dets, #{file => File}}}.
+
+task(Id, State) ->
+    barrel_a2a_task:set_status(barrel_a2a_task:new(Id, <<"ctx">>), State, undefined).
+
+%% Configs are written through and read back on open. A config whose
+%% task is gone is dropped; one whose task is terminal is reported,
+%% because its final event was never delivered.
+backing_store_round_trip_test() ->
+    {File, Spec} = backing_spec(),
+    Tasks = #{<<"live">> => working, <<"done">> => completed},
+    TaskOf = fun(Id) ->
+        case maps:find(Id, Tasks) of
+            {ok, State} -> {ok, task(Id, State)};
+            error -> error
+        end
+    end,
+    {ok, S1, []} = barrel_a2a_push:open_store(Spec, barrel_a2a_push:normalize_opts(opts()), TaskOf),
+    {ok, Live} = barrel_a2a_push:create(S1, <<"live">>, config(), opts()),
+    {ok, Done} = barrel_a2a_push:create(S1, <<"done">>, config(), opts()),
+    {ok, _Gone} = barrel_a2a_push:create(S1, <<"gone">>, config(), opts()),
+    {ok, Deleted} = barrel_a2a_push:create(S1, <<"live">>, config(), opts()),
+    ok = barrel_a2a_push:delete(S1, <<"live">>, maps:get(<<"id">>, Deleted)),
+    ok = barrel_a2a_push:close_store(S1),
+    ets:delete(S1),
+
+    {ok, S2, Unsent} = barrel_a2a_push:open_store(Spec, opts(), TaskOf),
+    ?assertEqual([<<"done">>], [barrel_a2a_task:id(T) || T <- Unsent]),
+    ?assertEqual({ok, Live}, barrel_a2a_push:get(S2, <<"live">>, maps:get(<<"id">>, Live))),
+    ?assertEqual({ok, Done}, barrel_a2a_push:get(S2, <<"done">>, maps:get(<<"id">>, Done))),
+    {ok, [_], <<>>} = barrel_a2a_push:list(S2, <<"live">>, undefined, undefined),
+    {ok, [], <<>>} = barrel_a2a_push:list(S2, <<"gone">>, undefined, undefined),
+    %% The recorded options are the ones given at open.
+    ?assertEqual(opts(), barrel_a2a_push:opts(S2)),
+    ok = barrel_a2a_push:close_store(S2),
+    ets:delete(S2),
+
+    %% The dropped config is gone from the backing store too.
+    {ok, S3, _} = barrel_a2a_push:open_store(Spec, opts(), fun(_) -> {ok, task(x, working)} end),
+    {ok, [], <<>>} = barrel_a2a_push:list(S3, <<"gone">>, undefined, undefined),
+    ok = barrel_a2a_push:close_store(S3),
+    file:delete(File).
+
+no_backing_store_test() ->
+    {ok, S, []} = barrel_a2a_push:open_store(undefined, opts(), fun(_) -> error end),
+    ?assertEqual(undefined, barrel_a2a_push:store_owner(S)),
+    ?assertEqual(ok, barrel_a2a_push:close_store(S)),
+    {ok, _} = barrel_a2a_push:create(S, ?TASK, config(), opts()).

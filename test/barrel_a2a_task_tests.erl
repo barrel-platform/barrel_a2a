@@ -1120,3 +1120,155 @@ drain_until_final(Id, N) ->
         _ ->
             drain_until_final(Id, N - 1)
     end.
+
+%%--------------------------------------------------------------------
+%% Resumed tasks
+%%--------------------------------------------------------------------
+
+%% A task process started from a stored snapshot, as the server does
+%% for a task its application resumes.
+start_resumed(Fun, State) ->
+    start_resumed(Fun, State, fun(_, _) -> {error, <<"handler must not run">>} end).
+
+start_resumed(Fun, State, Handler) ->
+    Tab = barrel_a2a_task_registry:new(),
+    Id = barrel_a2a_id:uuid(),
+    Msg = barrel_a2a_message:new(<<"hello">>, #{message_id => <<"m1">>}),
+    Task0 = barrel_a2a_task:add_history(barrel_a2a_task:new(Id, <<"c1">>), Msg, unlimited),
+    Task = barrel_a2a_task:set_status(Task0, State, undefined),
+    ok = barrel_a2a_task_registry:insert(Tab, #{id => Id, task => Task, owner => alice}),
+    {ok, Pid} = barrel_a2a_task_proc:start_link(#{
+        cfg => #{handler => Handler, registry => Tab},
+        task => Task,
+        owner => alice,
+        req => #{},
+        resume => Fun
+    }),
+    track(Pid),
+    %% The row names the process before anything runs.
+    {ok, #{pid := Pid}} = barrel_a2a_task_registry:lookup(Tab, Id),
+    {ok, Snap} = barrel_a2a_task_proc:subscribe(Pid, self()),
+    ?assertEqual(State, barrel_a2a_task:state(Snap)),
+    #{pid => Pid, id => Id, tab => Tab}.
+
+resume_completes_test_() ->
+    t(fun() ->
+        Test = self(),
+        Fun = fun(Ctx) ->
+            Test ! {ctx, Ctx},
+            {ok, barrel_a2a_part:data(#{<<"x">> => 1})}
+        end,
+        #{pid := Pid, id := Id} = S = start_resumed(Fun, working),
+        ok = barrel_a2a_task_proc:run(Pid),
+        {ctx, Ctx} = recv(ctx),
+        ?assertEqual(Id, barrel_a2a_ctx:task_id(Ctx)),
+        ?assertEqual(<<"c1">>, barrel_a2a_ctx:context_id(Ctx)),
+        ?assertEqual(<<"hello">>, barrel_a2a_message:text(barrel_a2a_ctx:message(Ctx))),
+        ?assertEqual(alice, barrel_a2a_ctx:principal(Ctx)),
+        ?assert(barrel_a2a_ctx:is_follow_up(Ctx)),
+        _ = expect_artifact(Id),
+        _ = expect_status(Id, completed),
+        no_more_events(),
+        normal = wait_down(Pid),
+        {T, #{state := completed, owner := alice}} = snapshot(S),
+        [A] = barrel_a2a_task:artifacts(T),
+        ?assertMatch([#{<<"data">> := #{<<"x">> := 1}}], barrel_a2a_artifact:parts(A))
+    end).
+
+resume_from_submitted_test_() ->
+    t(fun() ->
+        Fun = fun(Ctx) ->
+            ok = barrel_a2a_ctx:status(Ctx, working, #{message => <<"following">>}),
+            {reject, <<"no">>}
+        end,
+        #{pid := Pid, id := Id} = S = start_resumed(Fun, submitted),
+        ok = barrel_a2a_task_proc:run(Pid),
+        _ = expect_status(Id, working),
+        _ = expect_status(Id, working),
+        _ = expect_status(Id, rejected),
+        no_more_events(),
+        {_, #{state := rejected}} = snapshot(S)
+    end).
+
+%% A kept task stays paused and runs nothing until its client answers;
+%% the answer then goes to the handler as a follow-up.
+resume_keep_waits_for_client_test_() ->
+    t(fun() ->
+        Test = self(),
+        Handler = fun(Ctx, M) ->
+            Test ! {handler, barrel_a2a_ctx:is_follow_up(Ctx)},
+            {ok, barrel_a2a_message:text(M)}
+        end,
+        #{pid := Pid, id := Id} = S = start_resumed(keep, input_required, Handler),
+        ok = barrel_a2a_task_proc:run(Pid),
+        no_more_events(),
+        {_, #{state := input_required}} = snapshot(S),
+        Answer = barrel_a2a_message:new(<<"blue">>, #{task_id => Id, context_id => <<"c1">>}),
+        ok = barrel_a2a_task_proc:send_message(Pid, Answer, #{}),
+        _ = expect_status(Id, working),
+        {handler, true} = recv(handler),
+        _ = expect_artifact(Id),
+        _ = expect_status(Id, completed),
+        {T, #{state := completed}} = snapshot(S),
+        ?assertEqual(<<"blue">>, barrel_a2a_artifact:text(hd(barrel_a2a_task:artifacts(T))))
+    end).
+
+resume_crash_fails_task_test_() ->
+    t(fun() ->
+        #{pid := Pid, id := Id} = S = start_resumed(fun(_) -> error(boom) end, working),
+        ok = barrel_a2a_task_proc:run(Pid),
+        Status = expect_status(Id, failed),
+        ?assertEqual(
+            <<"Handler crashed">>, barrel_a2a_message:text(maps:get(<<"message">>, Status))
+        ),
+        {_, #{state := failed}} = snapshot(S)
+    end).
+
+resume_cancel_seen_by_fun_test_() ->
+    t(fun() ->
+        Test = self(),
+        Fun = fun(Ctx) ->
+            Test ! {worker, self()},
+            Loop = fun Loop() ->
+                case barrel_a2a_ctx:cancelled(Ctx) of
+                    true ->
+                        Test ! {worker, saw_cancel},
+                        {ok, <<"late">>};
+                    false ->
+                        timer:sleep(10),
+                        Loop()
+                end
+            end,
+            Loop()
+        end,
+        #{pid := Pid, id := Id} = S = start_resumed(Fun, working),
+        ok = barrel_a2a_task_proc:run(Pid),
+        {worker, Worker} = recv(worker),
+        {ok, T} = barrel_a2a_task_proc:cancel(Pid, #{}),
+        ?assertEqual(canceled, barrel_a2a_task:state(T)),
+        {worker, saw_cancel} = recv(worker),
+        _ = expect_status(Id, canceled),
+        %% The fun's late answer is discarded.
+        no_more_events(),
+        ?assertNot(is_process_alive(Worker)),
+        {T1, #{state := canceled}} = snapshot(S),
+        ?assertEqual([], barrel_a2a_task:artifacts(T1))
+    end).
+
+resume_cancel_grace_kills_test_() ->
+    t(fun() ->
+        Test = self(),
+        Fun = fun(_Ctx) ->
+            Test ! {worker, self()},
+            receive
+                never -> ok
+            end
+        end,
+        #{pid := Pid, id := Id} = start_resumed(Fun, working),
+        ok = barrel_a2a_task_proc:run(Pid),
+        {worker, Worker} = recv(worker),
+        {ok, T} = barrel_a2a_task_proc:cancel(Pid, #{}),
+        ?assertEqual(canceled, barrel_a2a_task:state(T)),
+        _ = expect_status(Id, canceled),
+        ?assertNot(is_process_alive(Worker))
+    end).

@@ -7,7 +7,10 @@
 %%% scoping (specification 13.1). Live tasks update their row on every
 %%% transition; finished tasks keep their snapshot until `task_ttl'
 %%% expires. On open, rows left by a previous run whose task was still
-%%% running are marked failed: their workers are gone.
+%%% running are marked failed: their workers are gone. With a `resume'
+%%% fun (see {@link new/2}) the application may take such a task back
+%%% instead, or keep a paused one waiting for its client; its row is
+%%% kept and the server starts a process for it.
 %%%
 %%% ListTasks (3.1.4) sorts by status timestamp descending and uses an
 %%% opaque cursor `{TimestampMs, TaskId}' for pagination.
@@ -16,7 +19,16 @@
 -module(barrel_a2a_task_registry).
 
 -export([
-    new/0, new/1, close/1, owner/1, insert/2, update/2, delete/2, lookup/2, list/2, expire/2, all/1
+    new/0, new/1, new/2,
+    close/1,
+    owner/1,
+    insert/2,
+    update/2,
+    delete/2,
+    lookup/2,
+    list/2,
+    expire/2,
+    all/1
 ]).
 
 -record(row, {
@@ -52,7 +64,17 @@
     page_token => binary() | undefined
 }.
 
--export_type([table/0, entry/0, filter/0]).
+%% Asked once per unfinished row on open. Any task may answer `fail'
+%% (the default behaviour). A `submitted' or `working' task may answer
+%% `{resume, Fun}', where `Fun(Ctx)' answers as a handler does. A
+%% paused task (`input_required', `auth_required') may answer `keep':
+%% it stays paused and the client's next message continues it.
+-type resume() :: fun(
+    (barrel_a2a:task()) -> {resume, fun((barrel_a2a_ctx:ctx()) -> term())} | keep | fail
+).
+-type resumed() :: {binary(), fun((barrel_a2a_ctx:ctx()) -> term()) | keep}.
+
+-export_type([table/0, entry/0, filter/0, resume/0, resumed/0]).
 
 %% Both fixed by the specification: "If unspecified, at most 50 tasks
 %% will be returned. The minimum value is 1. The maximum value is 100."
@@ -67,31 +89,80 @@ new() ->
 %% @doc Open a store and repair rows left by a previous run.
 -spec new({module(), map()}) -> {ok, table()} | {error, term()}.
 new(Spec) ->
+    case new(Spec, undefined) of
+        {ok, Store, []} -> {ok, Store};
+        {error, _} = E -> E
+    end.
+
+%% @doc As {@link new/1}, asking `Resume' what to do with each
+%% unfinished row. Returns the tasks to resume with their funs, and
+%% the paused tasks to keep.
+-spec new({module(), map()}, resume() | undefined) ->
+    {ok, table(), [resumed()]} | {error, term()}.
+new(Spec, Resume) ->
     case barrel_a2a_task_store:open(Spec) of
         {ok, Store} ->
-            lists:foreach(fun(Row) -> repair(Store, Row) end, barrel_a2a_task_store:all(Store)),
-            {ok, Store};
+            Resumed = lists:foldl(
+                fun(Row, Acc) ->
+                    case repair(Store, Row, Resume) of
+                        {resume, Id, How} -> [{Id, How} | Acc];
+                        ok -> Acc
+                    end
+                end,
+                [],
+                barrel_a2a_task_store:all(Store)
+            ),
+            {ok, Store, lists:reverse(Resumed)};
         {error, _} = E ->
             E
     end.
 
-%% A task whose process is gone cannot continue: terminal rows keep
-%% their snapshot, others become failed with an explanatory message.
-repair(Store, Map) ->
+%% A task whose process is gone cannot continue on its own: terminal
+%% rows keep their snapshot, others become failed with an explanatory
+%% message unless the application resumes them.
+repair(Store, Map, Resume) ->
     Raw = maps:get(pid, Map, undefined),
-    #row{state = State, task = Task, owner = Owner, id = Id} = Row = from_map(Map),
+    #row{state = State, task = Task, id = Id} = Row = from_map(Map),
     case {barrel_a2a_task_state:is_terminal(State), Raw} of
         {true, undefined} ->
             ok;
         {true, _} ->
             barrel_a2a_task_store:put(Store, to_map(Row#row{pid = undefined}));
         {false, _} ->
-            Msg = barrel_a2a_message:agent(<<"Task interrupted by a server restart">>),
-            Failed = barrel_a2a_task:set_status(Task, failed, Msg),
-            barrel_a2a_task_store:put(
-                Store, to_map(to_row(#{id => Id, task => Failed, owner => Owner}))
-            )
+            case ask_resume(Resume, Id, Task, barrel_a2a_task_state:is_interrupted(State)) of
+                fail ->
+                    fail_row(Store, Row);
+                How ->
+                    barrel_a2a_task_store:put(Store, to_map(Row#row{pid = undefined})),
+                    {resume, Id, How}
+            end
     end.
+
+%% A paused task waits for its client, so it cannot be run again
+%% without one: it may only be kept, and a running one only resumed.
+ask_resume(undefined, _Id, _Task, _Paused) ->
+    fail;
+ask_resume(Resume, Id, Task, Paused) ->
+    try Resume(Task) of
+        {resume, Fun} when is_function(Fun, 1), not Paused ->
+            Fun;
+        keep when Paused ->
+            keep;
+        fail ->
+            fail;
+        Other ->
+            logger:warning("a2a task ~s: resume returned ~0p, failing it", [Id, Other]),
+            fail
+    catch
+        Class:Reason ->
+            logger:warning("a2a task ~s: resume crashed ~0p:~0p, failing it", [Id, Class, Reason]),
+            fail
+    end.
+
+fail_row(Store, #row{id = Id, task = Task, owner = Owner}) ->
+    Msg = barrel_a2a_message:agent(<<"Task interrupted by a server restart">>),
+    Failed = barrel_a2a_task:set_status(Task, failed, Msg),
+    barrel_a2a_task_store:put(Store, to_map(to_row(#{id => Id, task => Failed, owner => Owner}))).
 
 -spec close(table()) -> ok.
 close(Store) -> barrel_a2a_task_store:close(Store).

@@ -53,6 +53,20 @@
 %%% - `task_store': `{Module, Opts}' implementing `barrel_a2a_task_store'
 %%%   (default in-memory ETS; `{barrel_a2a_task_store_dets, #{file =>
 %%%   Path}}' persists tasks across restarts).
+%%% - `push_config_store': `{Module, Opts}' implementing
+%%%   `barrel_a2a_task_store' to keep push notification configs across
+%%%   restarts (default in memory). Used when `push_notifications' is
+%%%   on. On start, a config whose task is terminal gets the task's final
+%%%   status delivered again: it was never acknowledged.
+%%% - `resume': `fun((Task) -> {resume, Fun} | keep | fail)', asked on
+%%%   start for each unfinished task found in the store. `fail' (and
+%%%   the default, no option) marks it failed. A `submitted' or
+%%%   `working' task may answer `{resume, Fun}': a task process runs
+%%%   `Fun(Ctx)', which answers as a handler does. A paused task
+%%%   (`input_required', `auth_required') may answer `keep': it stays
+%%%   paused and the client's next message continues it. Any other
+%%%   answer fails the task. It runs during server start, so keep it
+%%%   quick.
 %%% - `blocking_timeout': `infinity' (default) waits for a terminal or
 %%%   interrupted state, as the specification requires of a send with
 %%%   `returnImmediately' unset or false. The wait still ends as soon
@@ -116,6 +130,8 @@
     %% store's writer). Linked, so its death stops the server.
     store_owner := pid() | undefined,
     push_store := barrel_a2a_push:store(),
+    %% The same for the push config store's backing store.
+    push_store_owner := pid() | undefined,
     %% Application behaviour.
     handler := barrel_a2a_handler:handler(),
     auth := barrel_a2a_auth:config(),
@@ -265,8 +281,12 @@ url(Server) -> maps:get(url, config(Server), undefined).
 init({InstSup, #{card := Card0, opts := Opts}}) ->
     process_flag(trap_exit, true),
     try
-        Cfg0 = build_config(InstSup, Card0, Opts),
+        {Cfg0, Resumed, Unsent} = build_config(InstSup, Card0, Opts),
         persistent_term:put({?MODULE, self()}, Cfg0),
+        %% Before the listener, so no request sees a resumed task
+        %% without its process.
+        ok = barrel_a2a_server_core:resume_tasks(Cfg0, Resumed),
+        ok = redeliver_final(Cfg0, Unsent),
         %% Stored again before the card is finalized so that a failure
         %% in `finalize_card/1' can still find the listener to stop.
         Cfg1 = maybe_listen(Cfg0),
@@ -300,10 +320,31 @@ undo(Reason) ->
                     Id -> barrel_a2a_listener_sup:stop_listener(Id)
                 end,
             _ = barrel_a2a_task_registry:close(maps:get(registry, Cfg)),
+            _ = barrel_a2a_push:close_store(maps:get(push_store, Cfg)),
             _ = persistent_term:erase({?MODULE, self()}),
             ok
     end,
     Reason.
+
+%% A push config that survived a restart while its task is terminal was
+%% never cleared by its worker, so the final event was not delivered:
+%% the task finished as the node went down, or was failed by the
+%% restart itself. Delivery is at least once (4.3), so send it again.
+redeliver_final(#{push_notify := undefined}, _) ->
+    ok;
+redeliver_final(#{push_notify := Notify}, Tasks) ->
+    lists:foreach(
+        fun(Task) ->
+            Id = barrel_a2a_task:id(Task),
+            Notify(
+                Id,
+                barrel_a2a_event:status_update(
+                    Id, barrel_a2a_task:context_id(Task), barrel_a2a_task:status(Task)
+                )
+            )
+        end,
+        Tasks
+    ).
 
 %% The expiry sweep runs at most once a minute and at least once a
 %% second: `task_ttl' can legitimately be 0 (expire as soon as a task is
@@ -344,7 +385,8 @@ handle_info({'EXIT', Pid, Reason}, #{cfg := Cfg} = St) ->
     Linked = [
         maps:get(task_sup, Cfg),
         maps:get(push_sup, Cfg),
-        maps:get(store_owner, Cfg)
+        maps:get(store_owner, Cfg),
+        maps:get(push_store_owner, Cfg)
     ],
     case lists:member(Pid, Linked) of
         true -> {stop, {linked_process_down, Pid, Reason}, St};
@@ -361,6 +403,7 @@ terminate(_Reason, #{cfg := Cfg}) ->
             Id -> barrel_a2a_listener_sup:stop_listener(Id)
         end,
     _ = barrel_a2a_task_registry:close(maps:get(registry, Cfg)),
+    _ = barrel_a2a_push:close_store(maps:get(push_store, Cfg)),
     _ = persistent_term:erase({?MODULE, self()}),
     ok.
 
@@ -383,12 +426,15 @@ build_config(InstSup, Card0, Opts) ->
             true -> Card0;
             false -> throw({invalid_option, {card, Card0}})
         end,
-    Registry =
-        case barrel_a2a_task_registry:new(task_store_opt(maps:get(task_store, Opts, undefined))) of
-            {ok, R} -> R;
+    Resume = resume_opt(maps:get(resume, Opts, undefined)),
+    StoreSpec = task_store_opt(maps:get(task_store, Opts, undefined)),
+    PushSpec = push_config_store_opt(maps:get(push_config_store, Opts, undefined)),
+    {Registry, Resumed} =
+        case barrel_a2a_task_registry:new(StoreSpec, Resume) of
+            {ok, R, Rs} -> {R, Rs};
             {error, Reason} -> throw({invalid_option, {task_store, Reason}})
         end,
-    PushStore = barrel_a2a_push:new_store(),
+    {PushStore, Unsent} = push_store(Push, PushSpec, Registry),
     %% `undefined' for a store that is just data, such as the ETS one.
     StoreOwner = barrel_a2a_task_registry:owner(Registry),
     Base = base_path(maps:get(base_path, Opts, ?DEFAULT_BASE)),
@@ -401,6 +447,7 @@ build_config(InstSup, Card0, Opts) ->
         registry => Registry,
         store_owner => StoreOwner,
         push_store => PushStore,
+        push_store_owner => barrel_a2a_push:store_owner(PushStore),
         card_base => Card,
         handler => Handler,
         auth => Auth,
@@ -437,7 +484,7 @@ build_config(InstSup, Card0, Opts) ->
             tenant => maps:get(tenant, Opts, undefined)
         }
     },
-    Cfg#{push_notify => push_notify_fun(Cfg)}.
+    {Cfg#{push_notify => push_notify_fun(Cfg)}, Resumed, Unsent}.
 
 required({ok, V}, _) -> V;
 required({error, Reason}, Key) -> throw({invalid_option, {Key, Reason}}).
@@ -446,6 +493,15 @@ authorize_opt(owner) -> owner;
 authorize_opt(any) -> any;
 authorize_opt(F) when is_function(F, 2) -> F;
 authorize_opt(Other) -> throw({invalid_option, {authorize, Other}}).
+
+resume_opt(undefined) -> undefined;
+resume_opt(F) when is_function(F, 1) -> F;
+resume_opt(Other) -> throw({invalid_option, {resume, Other}}).
+
+push_config_store_opt(undefined) -> undefined;
+push_config_store_opt({Mod, O}) when is_atom(Mod), is_map(O) -> {Mod, O};
+push_config_store_opt(Mod) when is_atom(Mod) -> {Mod, #{}};
+push_config_store_opt(Other) -> throw({invalid_option, {push_config_store, Other}}).
 
 task_store_opt(undefined) -> {barrel_a2a_task_store_ets, #{}};
 task_store_opt({Mod, O}) when is_atom(Mod), is_map(O) -> {Mod, O};
@@ -478,6 +534,25 @@ push_opt(Opts, PushSup) when is_map(Opts) ->
     barrel_a2a_push:normalize_opts(Opts#{sup => PushSup});
 push_opt(Other, _) ->
     throw({invalid_option, {push_notifications, Other}}).
+
+%% Configs can only exist with push notifications on, so a backing
+%% store is only opened then.
+push_store(false, _Spec, _Registry) ->
+    {barrel_a2a_push:new_store(), []};
+push_store(Push, Spec, Registry) ->
+    TaskOf = fun(TaskId) ->
+        case barrel_a2a_task_registry:lookup(Registry, TaskId) of
+            {ok, #{task := Task}} -> {ok, Task};
+            error -> error
+        end
+    end,
+    case barrel_a2a_push:open_store(Spec, Push, TaskOf) of
+        {ok, Store, Unsent} ->
+            {Store, Unsent};
+        {error, Reason} ->
+            _ = barrel_a2a_task_registry:close(Registry),
+            throw({invalid_option, {push_config_store, Reason}})
+    end.
 
 push_notify_fun(#{push := false}) ->
     undefined;

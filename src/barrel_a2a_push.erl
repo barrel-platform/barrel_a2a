@@ -9,6 +9,11 @@
 %%% state (the worker removes its config after delivering the final
 %%% event) or the client deletes them.
 %%%
+%%% With a backing `barrel_a2a_task_store' ({@link open_store/3}, server
+%%% option `push_config_store'), every config written to or removed
+%%% from the table is written through to it, and the table is filled
+%%% from it on open, so configs outlive a restart like their tasks.
+%%%
 %%% `notify/3' is the fan-out point the task process calls with each
 %%% `StreamResponse': every config of the task gets its own ordered
 %%% delivery worker (see {@link barrel_a2a_push_delivery}).
@@ -21,7 +26,8 @@
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_push).
 
--export([new_store/0, create/4, get/3, list/4, delete/3, delete_task/2, notify/3]).
+-export([new_store/0, open_store/3, close_store/1, store_owner/1]).
+-export([create/4, get/3, list/4, delete/3, delete_task/2, notify/3]).
 -export([validate_url/2, normalize_opts/1]).
 -export([opts/1, take_overflow/2]).
 
@@ -81,6 +87,79 @@ opts(Store) ->
 new_store() ->
     ets:new(barrel_a2a_push, [ordered_set, public, {read_concurrency, true}]).
 
+%% @doc A store for a server: `Opts' recorded for delivery, and, with a
+%% `{Module, Opts}' spec, a backing store the table is loaded from and
+%% written through to. `TaskOf(TaskId)' reads the task of a loaded
+%% config: a config whose task is gone is dropped. Returns the tasks
+%% that are terminal although their configs remain: their final event
+%% was never delivered, so the caller sends it again.
+-spec open_store(
+    {module(), map()} | undefined,
+    opts(),
+    fun((binary()) -> {ok, barrel_a2a:task()} | error)
+) ->
+    {ok, store(), [barrel_a2a:task()]} | {error, term()}.
+open_store(Spec, Opts, TaskOf) ->
+    Store = new_store(),
+    true = ets:insert(Store, {opts, Opts}),
+    case Spec of
+        undefined ->
+            {ok, Store, []};
+        _ ->
+            case barrel_a2a_task_store:open(Spec) of
+                {ok, Backing} ->
+                    true = ets:insert(Store, {backing, Backing}),
+                    {ok, Store, load(Store, Backing, TaskOf)};
+                {error, _} = E ->
+                    ets:delete(Store),
+                    E
+            end
+    end.
+
+load(Store, Backing, TaskOf) ->
+    Unsent = lists:foldl(
+        fun(#{id := Id, task_id := TaskId, config := Config}, Acc) ->
+            case TaskOf(TaskId) of
+                {ok, Task} ->
+                    true = ets:insert(Store, {{TaskId, Id}, Config}),
+                    case barrel_a2a_task:is_terminal(Task) of
+                        true -> Acc#{TaskId => Task};
+                        false -> Acc
+                    end;
+                error ->
+                    barrel_a2a_task_store:delete(Backing, Id),
+                    Acc
+            end
+        end,
+        #{},
+        barrel_a2a_task_store:all(Backing)
+    ),
+    maps:values(Unsent).
+
+%% @doc Close the backing store, if any. The table goes with its owner.
+-spec close_store(store()) -> ok.
+close_store(Store) ->
+    case backing(Store) of
+        undefined -> ok;
+        Backing -> barrel_a2a_task_store:close(Backing)
+    end.
+
+%% @doc The process the backing store depends on, or `undefined'.
+-spec store_owner(store()) -> pid() | undefined.
+store_owner(Store) ->
+    case backing(Store) of
+        undefined -> undefined;
+        Backing -> barrel_a2a_task_store:owner(Backing)
+    end.
+
+backing(Store) ->
+    try ets:lookup(Store, backing) of
+        [{backing, Backing}] -> Backing;
+        [] -> undefined
+    catch
+        error:badarg -> undefined
+    end.
+
 %% @doc Create a config for a task. The client-supplied `id' is
 %% dropped and a fresh one assigned; `taskId' is set to `TaskId'.
 %% Authorization (the task belongs to the caller) is the caller's job.
@@ -96,6 +175,11 @@ create(Store, TaskId, Config, Opts0) when is_map(Config) ->
                     Config1 = Config#{<<"id">> => Id, <<"taskId">> => TaskId},
                     true = ets:insert(Store, {opts, Opts}),
                     true = ets:insert(Store, {{TaskId, Id}, Config1}),
+                    write_through(Store, fun(B) ->
+                        barrel_a2a_task_store:put(B, #{
+                            id => Id, task_id => TaskId, config => Config1
+                        })
+                    end),
                     {ok, Config1};
                 {error, Why} ->
                     {error, barrel_a2a_error:invalid(<<"url">>, Why)}
@@ -138,9 +222,16 @@ list(Store, TaskId, PageSize, PageToken) ->
 -spec delete(store(), binary(), binary()) -> ok.
 delete(Store, TaskId, Id) ->
     true = ets:delete(Store, {TaskId, Id}),
+    write_through(Store, fun(B) -> barrel_a2a_task_store:delete(B, Id) end),
     %% The worker reads and clears this itself, but it may be gone.
     _ = ets:delete(Store, {overflow, Id}),
     stop_worker(Store, Id).
+
+write_through(Store, Fun) ->
+    case backing(Store) of
+        undefined -> ok;
+        Backing -> Fun(Backing)
+    end.
 
 %% @doc Remove every config of a task and stop their workers.
 -spec delete_task(store(), binary()) -> ok.

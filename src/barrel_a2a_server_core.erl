@@ -44,7 +44,7 @@
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_server_core).
 
--export([call/4, active_extensions/2]).
+-export([call/4, active_extensions/2, resume_tasks/2]).
 
 -type req_ctx() :: #{
     binding := jsonrpc | rest | grpc | atom(),
@@ -638,6 +638,40 @@ create_task(#{cfg := Cfg, principal := Principal, req := Req}, ContextId, Messag
     case barrel_a2a_task_sup:start_task(maps:get(task_sup, Cfg), Args) of
         {ok, Pid} -> Pid;
         {error, Reason} -> fail(barrel_a2a_error:internal({task_start_failed, Reason}))
+    end.
+
+%% @doc Start a task process for each task the application resumed or
+%% kept on open (see `barrel_a2a_task_registry:new/2'). A resumed one
+%% runs its fun, a kept one waits for its client; both under the same
+%% supervisor and row rules as a new task. Called by the server before
+%% its listener starts.
+-spec resume_tasks(barrel_a2a_server:cfg(), [barrel_a2a_task_registry:resumed()]) -> ok.
+resume_tasks(Cfg, Resumed) ->
+    lists:foreach(fun({TaskId, How}) -> resume_task(Cfg, TaskId, How) end, Resumed).
+
+resume_task(Cfg, TaskId, How) ->
+    {ok, #{task := Task, owner := Owner}} =
+        barrel_a2a_task_registry:lookup(maps:get(registry, Cfg), TaskId),
+    Args = #{
+        cfg => task_cfg(Cfg),
+        task => Task,
+        owner => Owner,
+        req => #{
+            configuration => #{},
+            metadata => #{},
+            extensions => [],
+            tenant => maps:get(tenant, Cfg),
+            principal => Owner,
+            binding => unknown
+        },
+        resume => How
+    },
+    case barrel_a2a_task_sup:start_task(maps:get(task_sup, Cfg), Args) of
+        {ok, Pid} ->
+            barrel_a2a_task_proc:run(Pid);
+        {error, Reason} ->
+            %% The row stays unfinished; the next start asks again.
+            logger:error("a2a task ~s: resume failed to start: ~0p", [TaskId, Reason])
     end.
 
 -spec task_cfg(barrel_a2a_server:cfg()) -> task_cfg().

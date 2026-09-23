@@ -135,3 +135,96 @@ owner_test() ->
 %% working.
 owner_defaults_to_undefined_test() ->
     ?assertEqual(undefined, barrel_a2a_task_store:owner({lists, some_state})).
+
+%% A store left by a previous run: one finished task, one running, one
+%% waiting for input.
+seeded_store() ->
+    File = dets_file(),
+    Spec = {barrel_a2a_task_store_dets, #{file => File}},
+    {ok, Store} = barrel_a2a_task_registry:new(Spec),
+    ok = barrel_a2a_task_registry:insert(Store, entry(<<"done">>, completed)),
+    ok = barrel_a2a_task_registry:insert(Store, entry(<<"run">>, working)),
+    ok = barrel_a2a_task_registry:insert(Store, entry(<<"ask">>, input_required)),
+    ok = barrel_a2a_task_registry:close(Store),
+    {File, Spec}.
+
+reopen_state(Store, Id) ->
+    {ok, #{task := T, pid := undefined}} = barrel_a2a_task_registry:lookup(Store, Id),
+    barrel_a2a_task:state(T).
+
+assert_interrupted(Store, Id) ->
+    {ok, #{task := T}} = barrel_a2a_task_registry:lookup(Store, Id),
+    ?assertEqual(failed, barrel_a2a_task:state(T)),
+    ?assertEqual(
+        <<"Task interrupted by a server restart">>,
+        barrel_a2a_message:text(barrel_a2a_task:status_message(T))
+    ).
+
+resume_undefined_fails_test() ->
+    {File, Spec} = seeded_store(),
+    {ok, Store, []} = barrel_a2a_task_registry:new(Spec, undefined),
+    ?assertEqual(completed, reopen_state(Store, <<"done">>)),
+    assert_interrupted(Store, <<"run">>),
+    assert_interrupted(Store, <<"ask">>),
+    ok = barrel_a2a_task_registry:close(Store),
+    file:delete(File).
+
+resume_fail_answer_fails_test() ->
+    {File, Spec} = seeded_store(),
+    {ok, Store, []} = barrel_a2a_task_registry:new(Spec, fun(_) -> fail end),
+    assert_interrupted(Store, <<"run">>),
+    assert_interrupted(Store, <<"ask">>),
+    ok = barrel_a2a_task_registry:close(Store),
+    file:delete(File).
+
+resume_crash_or_bad_answer_fails_test() ->
+    {File, Spec} = seeded_store(),
+    Resume = fun(Task) ->
+        case barrel_a2a_task:id(Task) of
+            <<"run">> -> error(boom);
+            _ -> {resume, not_a_fun}
+        end
+    end,
+    {ok, Store, []} = barrel_a2a_task_registry:new(Spec, Resume),
+    assert_interrupted(Store, <<"run">>),
+    assert_interrupted(Store, <<"ask">>),
+    ok = barrel_a2a_task_registry:close(Store),
+    file:delete(File).
+
+resume_keeps_rows_test() ->
+    {File, Spec} = seeded_store(),
+    Fun = fun(_Ctx) -> ok end,
+    Seen = ets:new(seen, [public, bag]),
+    Resume = fun(Task) ->
+        ets:insert(Seen, {barrel_a2a_task:id(Task)}),
+        case barrel_a2a_task:state(Task) of
+            working -> {resume, Fun};
+            input_required -> keep
+        end
+    end,
+    {ok, Store, Resumed} = barrel_a2a_task_registry:new(Spec, Resume),
+    %% Terminal rows are not offered.
+    ?assertEqual([{<<"ask">>}, {<<"run">>}], lists:sort(ets:tab2list(Seen))),
+    ?assertEqual([{<<"ask">>, keep}, {<<"run">>, Fun}], lists:sort(Resumed)),
+    ?assertEqual(completed, reopen_state(Store, <<"done">>)),
+    ?assertEqual(working, reopen_state(Store, <<"run">>)),
+    ?assertEqual(input_required, reopen_state(Store, <<"ask">>)),
+    {ok, #{owner := alice}} = barrel_a2a_task_registry:lookup(Store, <<"run">>),
+    ok = barrel_a2a_task_registry:close(Store),
+    file:delete(File).
+
+%% A paused task waits for its client and cannot be run without one; a
+%% running task has nothing to wait for. The wrong answer fails it.
+resume_answer_must_fit_state_test() ->
+    {File, Spec} = seeded_store(),
+    Resume = fun(Task) ->
+        case barrel_a2a_task:state(Task) of
+            working -> keep;
+            input_required -> {resume, fun(_) -> ok end}
+        end
+    end,
+    {ok, Store, []} = barrel_a2a_task_registry:new(Spec, Resume),
+    assert_interrupted(Store, <<"run">>),
+    assert_interrupted(Store, <<"ask">>),
+    ok = barrel_a2a_task_registry:close(Store),
+    file:delete(File).

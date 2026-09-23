@@ -29,6 +29,18 @@
 %%% The process exits `normal' shortly after the task reaches a
 %%% terminal state; the registry keeps the snapshot for GetTask.
 %%%
+%%% == Resumed tasks ==
+%%%
+%%% On server start the application may resume an unfinished task
+%%% found in the store (`resume' option). The process then starts from
+%%% the stored snapshot, already materialized, and {@link run/1} runs
+%%% the application's `Fun(Ctx)' in place of the handler. A paused
+%%% task the application keeps (`resume => keep') runs nothing: it
+%%% waits for the client's next message, as it did before the restart. Its answer is
+%%% handled as a handler result. On cancel its worker is not killed at
+%%% once: it gets the grace period to see `barrel_a2a_ctx:cancelled/1'
+%%% answer `true' and return (invariants.md, T12).
+%%%
 %%% == Neighbours ==
 %%%
 %%% Started by `barrel_a2a_task_sup' on behalf of
@@ -97,8 +109,13 @@
     subscribers = #{} :: #{pid() => reference()},
     %% The handler worker, if one is running. The reference is the
     %% staleness guard: a result carrying any other one belongs to a
-    %% worker that was killed during cancel and is discarded.
-    worker = undefined :: undefined | {pid(), reference(), barrel_a2a:message()},
+    %% worker that was killed during cancel and is discarded. The kind
+    %% says whether it runs the handler or a resume fun.
+    worker = undefined ::
+        undefined | {pid(), reference(), barrel_a2a:message(), handler | resume},
+    %% The resume fun of a resumed task, until `run' starts it, or
+    %% `keep' for a paused task that waits for its client.
+    resume = undefined :: undefined | keep | fun((barrel_a2a_ctx:ctx()) -> term()),
     %% Follow-up messages that arrived while a worker was running.
     %% Drained one at a time, so a handler is never concurrent for one
     %% task.
@@ -114,17 +131,28 @@
     done = false :: boolean()
 }).
 
--type args() :: #{
-    %% Only the three keys a task needs, not the whole server config.
-    cfg := barrel_a2a_server_core:task_cfg(),
-    task_id := binary(),
-    context_id := binary(),
-    message := barrel_a2a:message(),
-    owner := barrel_a2a:principal(),
-    %% What the request knew, replayed into every handler invocation.
-    req := barrel_a2a_server_core:task_req(),
-    metadata => map()
-}.
+-type args() ::
+    #{
+        %% Only the three keys a task needs, not the whole server config.
+        cfg := barrel_a2a_server_core:task_cfg(),
+        task_id := binary(),
+        context_id := binary(),
+        message := barrel_a2a:message(),
+        owner := barrel_a2a:principal(),
+        %% What the request knew, replayed into every handler invocation.
+        req := barrel_a2a_server_core:task_req(),
+        metadata => map()
+    }
+    %% A task resumed on server start: the stored snapshot and the fun
+    %% `run/1' calls in place of the handler, or `keep' for a paused
+    %% task that waits for its client.
+    | #{
+        cfg := barrel_a2a_server_core:task_cfg(),
+        task := barrel_a2a:task(),
+        owner := barrel_a2a:principal(),
+        req := barrel_a2a_server_core:task_req(),
+        resume := keep | fun((barrel_a2a_ctx:ctx()) -> term())
+    }.
 
 -export_type([args/0]).
 
@@ -270,6 +298,24 @@ ctx_resume(Pid, Message) -> gen_server:call(Pid, {ctx_resume, Message}).
 %%--------------------------------------------------------------------
 
 %% @private
+init(#{cfg := Cfg, task := Task, owner := Owner, req := Req, resume := Fun}) ->
+    process_flag(trap_exit, true),
+    St = #st{
+        cfg = Cfg,
+        task = Task,
+        task_id = barrel_a2a_task:id(Task),
+        context_id = barrel_a2a_task:context_id(Task),
+        owner = Owner,
+        req = Req,
+        materialized = true,
+        last_message = last_message(Task),
+        resume = Fun
+    },
+    %% The task already exists: take its row now, so GetTask and cancel
+    %% reach this process as soon as it is started. No event yet, there
+    %% is no subscriber.
+    registry_update(St, self()),
+    {ok, St};
 init(
     #{cfg := Cfg, task_id := Id, context_id := Ctx, message := Msg, owner := Owner, req := Req} = A
 ) ->
@@ -385,15 +431,25 @@ handle_call(_Other, _From, St) ->
     {reply, {error, unknown_call}, St}.
 
 %% @private
+handle_cast(run, #st{resume = keep} = St) ->
+    %% Paused: the client's next message continues it.
+    {noreply, St#st{resume = undefined}};
+handle_cast(run, #st{worker = undefined, resume = Fun} = St) when is_function(Fun, 1) ->
+    St1 =
+        case barrel_a2a_task:state(St#st.task) of
+            working -> St;
+            _ -> transition(St, working, undefined)
+        end,
+    {noreply, start_resume_worker(St1#st{resume = undefined}, Fun)};
 handle_cast(run, #st{worker = undefined} = St) ->
     {noreply, start_worker(St, St#st.last_message, St#st.req, initial)};
 handle_cast(_Other, St) ->
     {noreply, St}.
 
 %% @private
-handle_info({worker_result, Ref, Result}, #st{worker = {_, Ref, _}} = St) ->
+handle_info({worker_result, Ref, Result}, #st{worker = {_, Ref, _, _}} = St) ->
     {noreply, handle_result(Result, St#st{worker = undefined})};
-handle_info({'EXIT', Pid, Reason}, #st{worker = {Pid, _, _}} = St) ->
+handle_info({'EXIT', Pid, Reason}, #st{worker = {Pid, _, _, _}} = St) ->
     case Reason of
         normal ->
             %% Result message is already in the mailbox or was handled.
@@ -439,21 +495,30 @@ start_worker(St, Message, Req) ->
 %% `initial' invocations see no task in the context even when the task
 %% was materialized before the handler ran (returnImmediately).
 start_worker(St, Message, Req, Kind) ->
-    Self = self(),
-    Ref = make_ref(),
     Ctx = make_ctx(St, Message, Req, Kind),
     Handler = maps:get(handler, St#st.cfg),
+    Invoke = fun() -> barrel_a2a_handler:invoke(Handler, Ctx, Message) end,
+    spawn_worker(St, Message, handler, Invoke).
+
+%% A resumed task's fun sees the stored task, as a follow-up would.
+start_resume_worker(St, Fun) ->
+    Ctx = make_ctx(St, St#st.last_message, St#st.req),
+    spawn_worker(St, St#st.last_message, resume, fun() -> Fun(Ctx) end).
+
+spawn_worker(St, Message, Kind, Invoke) ->
+    Self = self(),
+    Ref = make_ref(),
     Pid = spawn_link(fun() ->
         Result =
             try
-                barrel_a2a_handler:invoke(Handler, Ctx, Message)
+                Invoke()
             catch
                 throw:{a2a_error, #{type := _} = Err} -> {error, Err};
                 Class:Reason:Stack -> {crash, Class, Reason, Stack}
             end,
         Self ! {worker_result, Ref, Result}
     end),
-    St#st{worker = {Pid, Ref, Message}}.
+    St#st{worker = {Pid, Ref, Message, Kind}}.
 
 make_ctx(St, Message, Req) ->
     make_ctx(St, Message, Req, follow_up).
@@ -478,7 +543,15 @@ task_for_ctx(_, follow_up) -> undefined.
 
 stop_worker(#st{worker = undefined} = St) ->
     St;
-stop_worker(#st{worker = {Pid, _Ref, Message}} = St) ->
+stop_worker(#st{worker = {Pid, Ref, _Message, resume}} = St) ->
+    %% A resume fun follows work that lives outside this process, so it
+    %% is given the grace period to see the cancel through its ctx and
+    %% return (invariants.md, T12). Its result is discarded.
+    await_resume_stop(Pid, Ref, deadline(?CANCEL_GRACE_MS)),
+    unlink(Pid),
+    exit(Pid, kill),
+    St#st{worker = undefined};
+stop_worker(#st{worker = {Pid, _Ref, Message, handler}} = St) ->
     Handler = maps:get(handler, St#st.cfg),
     Ctx = make_ctx(St, Message, St#st.req),
     %% This blocks the task process for up to ?CANCEL_GRACE_MS, so
@@ -505,6 +578,22 @@ stop_worker(#st{worker = {Pid, _Ref, Message}} = St) ->
     unlink(Pid),
     exit(Pid, kill),
     St#st{worker = undefined}.
+
+%% This process is inside `handle_call(cancel, ...)', so the worker's
+%% `cancelled/1' calls are answered here; any other ctx call waits and
+%% is refused once the task is canceled.
+await_resume_stop(Pid, Ref, Deadline) ->
+    receive
+        {'$gen_call', From, ctx_cancelled} ->
+            gen_server:reply(From, true),
+            await_resume_stop(Pid, Ref, Deadline);
+        {worker_result, Ref, _} ->
+            ok;
+        {'EXIT', Pid, _} ->
+            ok
+    after remaining(Deadline) ->
+        ok
+    end.
 
 %% Follow-ups pile up here while a worker runs, one task at a time, so
 %% a client that sends faster than the handler works would grow this
@@ -729,6 +818,15 @@ send_all(#st{subscribers = Subs} = St, Msg) ->
     St#st{subscribers = Kept}.
 
 history_limit(Cfg) -> maps:get(max_history, Cfg, unlimited).
+
+%% The message a resumed task's ctx carries: the latest from the user.
+last_message(Task) ->
+    History = barrel_a2a_task:history(Task),
+    case [M || M <- History, barrel_a2a_message:role(M) =:= user] of
+        [_ | _] = User -> lists:last(User);
+        [] when History =/= [] -> lists:last(History);
+        [] -> barrel_a2a_message:new(<<>>)
+    end.
 
 %% A dead subscriber reports no backlog; its monitor cleans it up.
 backlog(Pid) ->
