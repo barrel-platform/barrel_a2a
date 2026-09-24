@@ -8,12 +8,14 @@
 %%% survives restarts). Configure one with the server option
 %%% `task_store => {Module, Opts}'.
 %%%
-%%% A row is a map: `#{id, pid, task, context_id, state, status_ms,
-%%% owner, finished_ms}'. Stores treat it as opaque except for `id', so
-%%% the same stores also keep push notification configs (server option
+%%% A row is a map: `#{id, task, context_id, state, status_ms, owner,
+%%% finished_ms}'. Stores treat it as opaque except for `id', so the
+%%% same stores also keep push notification configs (server option
 %%% `push_config_store'), whose rows are `#{id, task_id, config}'.
-%%% Rows loaded by a store after a restart carry the pid of a process
-%%% that no longer exists; the registry repairs them on open.
+%%% A row never names a process, so a store may be persisted,
+%%% replicated or shared between nodes: the registry keeps task pids in
+%%% a table of its own node. On open it fails the unfinished rows a
+%%% previous run left, unless the application resumes them.
 %%%
 %%% A store backed by a process implements the optional {@link owner/1}
 %%% so the server can watch it; see `barrel_a2a_task_store_dets'.
@@ -25,7 +27,6 @@
 
 -type row() :: #{
     id := binary(),
-    pid := pid() | undefined,
     task := barrel_a2a:task(),
     context_id := binary() | undefined,
     state := barrel_a2a:state(),

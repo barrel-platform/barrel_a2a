@@ -2,9 +2,12 @@
 %%% @doc The per-server task index (ListTasks, GetTask, lookups).
 %%%
 %%% Rows live in a `barrel_a2a_task_store' (ETS by default, DETS for
-%%% persistence). Each row holds the task process (while it lives),
-%%% the latest snapshot, and the owner principal used for authorization
-%%% scoping (specification 13.1). Live tasks update their row on every
+%%% persistence). Each row holds the latest snapshot and the owner
+%%% principal used for authorization scoping (specification 13.1). The
+%%% task process is not part of the row: a pid only means something on
+%%% the node and run that made it, and a store may be persisted,
+%%% replicated or shared. It is kept in a table of this node, keyed by
+%%% task id, next to the store. Live tasks update their row on every
 %%% transition; finished tasks keep their snapshot until `task_ttl'
 %%% expires. On open, rows left by a previous run whose task was still
 %%% running are marked failed: their workers are gone. With a `resume'
@@ -33,7 +36,6 @@
 
 -record(row, {
     id :: binary(),
-    pid :: pid() | undefined,
     task :: barrel_a2a:task(),
     context_id :: binary() | undefined,
     state :: barrel_a2a:state(),
@@ -42,7 +44,7 @@
     finished_ms :: integer() | undefined
 }).
 
--type table() :: barrel_a2a_task_store:handle().
+-opaque table() :: {barrel_a2a_task_store:handle(), ets:table()}.
 -type entry() :: #{
     id := binary(),
     pid := pid() | undefined,
@@ -83,14 +85,14 @@
 
 -spec new() -> table().
 new() ->
-    {ok, Store} = new({barrel_a2a_task_store_ets, #{}}),
-    Store.
+    {ok, Tab} = new({barrel_a2a_task_store_ets, #{}}),
+    Tab.
 
 %% @doc Open a store and repair rows left by a previous run.
 -spec new({module(), map()}) -> {ok, table()} | {error, term()}.
 new(Spec) ->
     case new(Spec, undefined) of
-        {ok, Store, []} -> {ok, Store};
+        {ok, Tab, []} -> {ok, Tab};
         {error, _} = E -> E
     end.
 
@@ -102,6 +104,7 @@ new(Spec) ->
 new(Spec, Resume) ->
     case barrel_a2a_task_store:open(Spec) of
         {ok, Store} ->
+            Pids = ets:new(barrel_a2a_task_pids, [set, public, {read_concurrency, true}]),
             Resumed = lists:foldl(
                 fun(Row, Acc) ->
                     case repair(Store, Row, Resume) of
@@ -112,31 +115,32 @@ new(Spec, Resume) ->
                 [],
                 barrel_a2a_task_store:all(Store)
             ),
-            {ok, Store, lists:reverse(Resumed)};
+            {ok, {Store, Pids}, lists:reverse(Resumed)};
         {error, _} = E ->
             E
     end.
 
-%% A task whose process is gone cannot continue on its own: terminal
-%% rows keep their snapshot, others become failed with an explanatory
-%% message unless the application resumes them.
+%% No task has a process yet: terminal rows keep their snapshot,
+%% others become failed with an explanatory message unless the
+%% application resumes them. A row written before 0.2.2 may still carry
+%% a `pid'; it is dropped here.
 repair(Store, Map, Resume) ->
-    Raw = maps:get(pid, Map, undefined),
     #row{state = State, task = Task, id = Id} = Row = from_map(Map),
-    case {barrel_a2a_task_state:is_terminal(State), Raw} of
-        {true, undefined} ->
-            ok;
-        {true, _} ->
-            barrel_a2a_task_store:put(Store, to_map(Row#row{pid = undefined}));
-        {false, _} ->
+    case barrel_a2a_task_state:is_terminal(State) of
+        true ->
+            drop_pid(Store, Map, Row);
+        false ->
             case ask_resume(Resume, Id, Task, barrel_a2a_task_state:is_interrupted(State)) of
                 fail ->
                     fail_row(Store, Row);
                 How ->
-                    barrel_a2a_task_store:put(Store, to_map(Row#row{pid = undefined})),
+                    drop_pid(Store, Map, Row),
                     {resume, Id, How}
             end
     end.
+
+drop_pid(Store, #{pid := _}, Row) -> barrel_a2a_task_store:put(Store, to_map(Row));
+drop_pid(_Store, _Map, _Row) -> ok.
 
 %% A paused task waits for its client, so it cannot be run again
 %% without one: it may only be kept, and a running one only resumed.
@@ -165,46 +169,52 @@ fail_row(Store, #row{id = Id, task = Task, owner = Owner}) ->
     barrel_a2a_task_store:put(Store, to_map(to_row(#{id => Id, task => Failed, owner => Owner}))).
 
 -spec close(table()) -> ok.
-close(Store) -> barrel_a2a_task_store:close(Store).
+close({Store, Pids}) ->
+    try
+        ets:delete(Pids)
+    catch
+        error:badarg -> ok
+    end,
+    barrel_a2a_task_store:close(Store).
 
 %% @doc The process the store depends on, or `undefined'. The server
 %% links it and stops when it dies; see the store behaviour.
 -spec owner(table()) -> pid() | undefined.
-owner(Store) -> barrel_a2a_task_store:owner(Store).
+owner({Store, _}) -> barrel_a2a_task_store:owner(Store).
 
 -spec insert(table(), entry()) -> ok.
-insert(Tab, Entry) ->
-    barrel_a2a_task_store:put(Tab, to_map(to_row(Entry))).
+insert({Store, _} = Tab, #{id := Id} = Entry) ->
+    ok = barrel_a2a_task_store:put(Store, to_map(to_row(Entry))),
+    set_pid(Tab, Id, Entry).
 
 %% @doc Store a new snapshot for a task. Keeps the owner and pid
 %% unless the entry carries them.
 -spec update(table(), entry()) -> ok.
-update(Tab, #{id := Id} = Entry) ->
+update({Store, _} = Tab, #{id := Id} = Entry) ->
     case fetch(Tab, Id) of
         {ok, Old} ->
             Merged = to_row(Entry),
-            Row = Merged#row{
-                owner = maps:get(owner, Entry, Old#row.owner),
-                pid = maps:get(pid, Entry, Old#row.pid)
-            },
-            barrel_a2a_task_store:put(Tab, to_map(Row));
+            Row = Merged#row{owner = maps:get(owner, Entry, Old#row.owner)},
+            ok = barrel_a2a_task_store:put(Store, to_map(Row)),
+            set_pid(Tab, Id, Entry);
         error ->
             insert(Tab, Entry)
     end.
 
 -spec delete(table(), binary()) -> ok.
-delete(Tab, Id) ->
-    barrel_a2a_task_store:delete(Tab, Id).
+delete({Store, Pids}, Id) ->
+    true = ets:delete(Pids, Id),
+    barrel_a2a_task_store:delete(Store, Id).
 
 -spec lookup(table(), binary()) -> {ok, entry()} | error.
 lookup(Tab, Id) ->
     case fetch(Tab, Id) of
-        {ok, Row} -> {ok, from_row(Row)};
+        {ok, Row} -> {ok, from_row(Tab, Row)};
         error -> error
     end.
 
 -spec all(table()) -> [entry()].
-all(Tab) -> [from_row(R) || R <- rows(Tab)].
+all(Tab) -> [from_row(Tab, R) || R <- rows(Tab)].
 
 %% @doc Filtered, sorted, paginated listing.
 -spec list(table(), filter()) ->
@@ -215,7 +225,7 @@ list(Tab, Filter) ->
         error ->
             {error, invalid_page_token};
         {ok, Cursor} ->
-            Rows = [R || R <- rows(Tab), matches(R, Filter)],
+            Rows = [R || R <- rows(Tab), matches(Tab, R, Filter)],
             Sorted = lists:sort(fun newer/2, Rows),
             Total = length(Sorted),
             AfterCursor = drop_until(Sorted, Cursor),
@@ -227,7 +237,7 @@ list(Tab, Filter) ->
                     {_, []} -> <<>>;
                     _ -> encode_token(lists:last(Page))
                 end,
-            {ok, [from_row(R) || R <- Page], Next, Total}
+            {ok, [from_row(Tab, R) || R <- Page], Next, Total}
     end.
 
 %% @doc Remove finished rows older than `TtlMs'.
@@ -235,23 +245,24 @@ list(Tab, Filter) ->
 expire(Tab, TtlMs) ->
     Now = barrel_a2a_time:now_ms(),
     Old = [
-        R#row.id
-     || #row{finished_ms = F, pid = undefined} = R <- rows(Tab),
+        Id
+     || #row{id = Id, finished_ms = F} <- rows(Tab),
         is_integer(F),
-        Now - F > TtlMs
+        Now - F > TtlMs,
+        pid(Tab, Id) =:= undefined
     ],
-    lists:foreach(fun(Id) -> barrel_a2a_task_store:delete(Tab, Id) end, Old),
+    lists:foreach(fun(Id) -> delete(Tab, Id) end, Old),
     length(Old).
 
-matches(Row, Filter) ->
+matches(Tab, Row, Filter) ->
     owner_ok(Row, maps:get(owner, Filter, any)) andalso
         context_ok(Row, maps:get(context_id, Filter, undefined)) andalso
         state_ok(Row, maps:get(state, Filter, undefined)) andalso
         after_ok(Row, maps:get(after_ms, Filter, undefined)) andalso
-        visible_ok(Row, maps:get(visible, Filter, undefined)).
+        visible_ok(Tab, Row, maps:get(visible, Filter, undefined)).
 
-visible_ok(_, undefined) -> true;
-visible_ok(Row, Fun) -> Fun(from_row(Row)) =:= true.
+visible_ok(_, _, undefined) -> true;
+visible_ok(Tab, Row, Fun) -> Fun(from_row(Tab, Row)) =:= true.
 
 owner_ok(_, any) -> true;
 owner_ok(#row{owner = O}, Owner) -> O =:= Owner.
@@ -309,7 +320,6 @@ to_row(#{id := Id, task := Task} = Entry) ->
         end,
     #row{
         id = Id,
-        pid = maps:get(pid, Entry, undefined),
         task = Task,
         context_id = barrel_a2a_task:context_id(Task),
         state = State,
@@ -329,25 +339,51 @@ status_ms(Task) ->
             end
     end.
 
-from_row(#row{id = Id, pid = Pid, task = Task, owner = Owner, state = State}) ->
-    #{id => Id, pid => Pid, task => Task, owner => Owner, state => State}.
+from_row(Tab, #row{id = Id, task = Task, owner = Owner, state = State}) ->
+    #{id => Id, pid => pid(Tab, Id), task => Task, owner => Owner, state => State}.
+
+%%--------------------------------------------------------------------
+%% Task processes
+%%--------------------------------------------------------------------
+
+%% Written after the row, in the same call, so a reader that sees the
+%% process also sees its row (invariants.md, T2).
+set_pid({_, Pids}, Id, #{pid := Pid}) when is_pid(Pid) ->
+    true = ets:insert(Pids, {Id, Pid}),
+    ok;
+set_pid({_, Pids}, Id, #{pid := undefined}) ->
+    true = ets:delete(Pids, Id),
+    ok;
+set_pid(_Tab, _Id, _Entry) ->
+    ok.
+
+%% A process that died without clearing its entry is not running.
+pid({_, Pids}, Id) ->
+    case ets:lookup(Pids, Id) of
+        [{_, Pid}] ->
+            case is_process_alive(Pid) of
+                true -> Pid;
+                false -> undefined
+            end;
+        [] ->
+            undefined
+    end.
 
 %%--------------------------------------------------------------------
 %% Store access
 %%--------------------------------------------------------------------
 
-fetch(Tab, Id) ->
-    case barrel_a2a_task_store:get(Tab, Id) of
+fetch({Store, _}, Id) ->
+    case barrel_a2a_task_store:get(Store, Id) of
         {ok, Map} -> {ok, from_map(Map)};
         error -> error
     end.
 
-rows(Tab) -> [from_map(M) || M <- barrel_a2a_task_store:all(Tab)].
+rows({Store, _}) -> [from_map(M) || M <- barrel_a2a_task_store:all(Store)].
 
 to_map(#row{} = R) ->
     #{
         id => R#row.id,
-        pid => R#row.pid,
         task => R#row.task,
         context_id => R#row.context_id,
         state => R#row.state,
@@ -359,7 +395,6 @@ to_map(#row{} = R) ->
 from_map(M) ->
     #row{
         id = maps:get(id, M),
-        pid = live_pid(maps:get(pid, M, undefined)),
         task = maps:get(task, M),
         context_id = maps:get(context_id, M, undefined),
         state = maps:get(state, M),
@@ -367,13 +402,3 @@ from_map(M) ->
         owner = maps:get(owner, M, anonymous),
         finished_ms = maps:get(finished_ms, M, undefined)
     }.
-
-%% A pid read back from a persistent store may belong to a previous
-%% run of the node.
-live_pid(Pid) when is_pid(Pid) ->
-    case is_process_alive(Pid) of
-        true -> Pid;
-        false -> undefined
-    end;
-live_pid(_) ->
-    undefined.

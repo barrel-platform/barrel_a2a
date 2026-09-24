@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.2
+
+### Fixed
+
+- Task store rows no longer carry the pid of the task process; the
+  registry keeps pids in a table of its own node. A row written by
+  another node, in a replicated or shared `task_store`, no longer
+  crashes server start with `badarg` in `is_process_alive/1`: an
+  unfinished task is failed or offered to `resume` as after a restart,
+  and a finished one is read from the store. A `pid` left in a row by
+  0.2.1 is dropped on open. Stores need no change.
+
 ## 0.2.1
 
 Tasks and their webhooks can outlive a server restart when tasks are

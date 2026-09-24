@@ -72,8 +72,8 @@ with no error anywhere.
 
 **T9. The task process is the only writer of its registry row.**
 Two deliberate exceptions: the registry repairs rows when a persistent
-store opens (failing an unfinished row, or clearing the pid of one the
-application resumes; the resumed task's process then writes it from
+store opens (failing an unfinished row; a row the application resumes
+is left as it is, and the resumed task's process then writes it from
 its `init/1` on), and the server closes the registry while task processes
 may still be alive, which is why the task process tolerates a closed
 table when it writes its final row.

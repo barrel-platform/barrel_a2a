@@ -40,6 +40,32 @@ dets_round_trip_test() ->
     ok = barrel_a2a_task_registry:close(Store2),
     file:delete(File).
 
+%% The task process lives in the registry, never in the store; a pid
+%% left by an older release is dropped on open.
+pid_not_stored_test() ->
+    File = dets_file(),
+    Spec = {barrel_a2a_task_store_dets, #{file => File}},
+    {ok, Store} = barrel_a2a_task_registry:new(Spec),
+    ok = barrel_a2a_task_registry:insert(Store, entry(<<"t1">>, working)),
+    ?assertMatch(
+        {ok, #{pid := P}} when P =:= self(), barrel_a2a_task_registry:lookup(Store, <<"t1">>)
+    ),
+    ok = barrel_a2a_task_registry:insert(Store, entry(<<"t2">>, completed)),
+    ok = barrel_a2a_task_registry:close(Store),
+    {ok, Raw} = barrel_a2a_task_store:open(Spec),
+    ?assertEqual([], [R || #{pid := _} = R <- barrel_a2a_task_store:all(Raw)]),
+    {ok, Row} = barrel_a2a_task_store:get(Raw, <<"t2">>),
+    ok = barrel_a2a_task_store:put(Raw, Row#{pid => self()}),
+    ok = barrel_a2a_task_store:close(Raw),
+    {ok, Store2} = barrel_a2a_task_registry:new(Spec),
+    ?assertMatch({ok, #{pid := undefined}}, barrel_a2a_task_registry:lookup(Store2, <<"t2">>)),
+    ok = barrel_a2a_task_registry:close(Store2),
+    {ok, Raw2} = barrel_a2a_task_store:open(Spec),
+    ?assertMatch({ok, #{id := <<"t2">>}}, barrel_a2a_task_store:get(Raw2, <<"t2">>)),
+    ?assertNotMatch({ok, #{pid := _}}, barrel_a2a_task_store:get(Raw2, <<"t2">>)),
+    ok = barrel_a2a_task_store:close(Raw2),
+    file:delete(File).
+
 dets_async_flush_test() ->
     File = dets_file(),
     {ok, Store} = barrel_a2a_task_store_dets:open(#{file => File, flush_interval => 50}),
