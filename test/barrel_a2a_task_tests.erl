@@ -1092,8 +1092,9 @@ slow_subscriber_is_dropped_test_() ->
         _ = drain_until_final(Id, 40),
         %% The slow one was cut off and told why, and is still alive.
         ?assert(is_process_alive(Slow)),
-        Slow ! release,
-        ?assert(saw_termination(Slow))
+        %% Read its mailbox before releasing it: once released it exits.
+        ?assert(saw_termination(Slow)),
+        Slow ! release
     end).
 
 %% Read the slow subscriber's mailbox from the outside: it never ran, so

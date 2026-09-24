@@ -26,7 +26,10 @@ groups() ->
         keep_paused_task,
         paused_task_cannot_be_run,
         push_config_survives_restart,
-        push_final_status_redelivered
+        push_final_status_redelivered,
+        foreign_pid_fails,
+        foreign_pid_resumed,
+        foreign_pid_terminal_get
     ],
     [{jsonrpc, [], Cases}, {rest, [], Cases}].
 
@@ -82,6 +85,35 @@ seed(Config, Ids, State) ->
         Ids
     ),
     ok = barrel_a2a_task_registry:close(Store).
+
+%% A row as a 0.2.1 file, or a store replicated from another node,
+%% leaves it: carrying the pid of a process on another node.
+seed_foreign(Config, Id, State) ->
+    {ok, Store} = barrel_a2a_task_store:open(?config(store, Config)),
+    Msg = barrel_a2a_message:new(<<"work on ", Id/binary>>),
+    Task0 = barrel_a2a_task:add_history(barrel_a2a_task:new(Id, <<"ctx-1">>), Msg, unlimited),
+    Task = barrel_a2a_task:set_status(Task0, State, undefined),
+    Finished =
+        case barrel_a2a_task_state:is_terminal(State) of
+            true -> barrel_a2a_time:now_ms();
+            false -> undefined
+        end,
+    ok = barrel_a2a_task_store:put(Store, #{
+        id => Id,
+        pid => foreign_pid(),
+        task => Task,
+        context_id => <<"ctx-1">>,
+        state => State,
+        status_ms => barrel_a2a_time:now_ms(),
+        owner => anonymous,
+        finished_ms => Finished
+    }),
+    ok = barrel_a2a_task_store:close(Store).
+
+%% `is_process_alive/1' raises on such a pid.
+foreign_pid() ->
+    Node = <<"ghost@nowhere">>,
+    binary_to_term(<<131, 88, 119, (byte_size(Node)), Node/binary, 0:32, 1:32, 1:32>>).
 
 start(Config, Extra) ->
     Opts = maps:merge(
@@ -316,3 +348,28 @@ invalid_option(_Config) ->
             push_config_store => 42
         })
     ).
+
+%% A row whose pid is on another node is a row with no process here.
+foreign_pid_fails(Config) ->
+    seed_foreign(Config, <<"t1">>, working),
+    {Server, Agent} = start(Config, #{}),
+    {ok, Task} = barrel_a2a_client:get_task(Agent, <<"t1">>),
+    ?assertEqual(failed, barrel_a2a_task:state(Task)),
+    ?assertEqual(<<"Task interrupted by a server restart">>, status_text(Task)),
+    barrel_a2a_server:stop(Server).
+
+foreign_pid_resumed(Config) ->
+    seed_foreign(Config, <<"t1">>, working),
+    Resume = fun(_) -> {resume, fun(_) -> {ok, barrel_a2a_part:text(<<"done">>)} end} end,
+    {Server, Agent} = start(Config, #{resume => Resume}),
+    Task = poll_until(Agent, <<"t1">>, completed, 100),
+    ?assertEqual(<<"ctx-1">>, barrel_a2a_task:context_id(Task)),
+    barrel_a2a_server:stop(Server).
+
+foreign_pid_terminal_get(Config) ->
+    seed_foreign(Config, <<"t1">>, completed),
+    {Server, Agent} = start(Config, #{}),
+    {ok, Task} = barrel_a2a_client:get_task(Agent, <<"t1">>),
+    ?assertEqual(completed, barrel_a2a_task:state(Task)),
+    ?assertMatch([_], barrel_a2a_task:history(Task)),
+    barrel_a2a_server:stop(Server).

@@ -48,7 +48,7 @@ This library implements the A2A boundary only; see
 
 ```erlang
 {deps, [
-    {barrel_a2a, "0.2.1"}
+    {barrel_a2a, "0.2.2"}
 ]}.
 ```
 
@@ -57,7 +57,7 @@ Or from git:
 ```erlang
 {deps, [
     {barrel_a2a,
-        {git, "https://github.com/barrel-platform/barrel_a2a.git", {tag, "v0.2.1"}}}
+        {git, "https://github.com/barrel-platform/barrel_a2a.git", {tag, "v0.2.2"}}}
 ]}.
 ```
 

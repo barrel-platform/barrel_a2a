@@ -10,7 +10,7 @@ Add the dependency to `rebar.config`:
 
 ```erlang
 {deps, [
-    {barrel_a2a, "0.2.1"}
+    {barrel_a2a, "0.2.2"}
 ]}.
 ```
 
