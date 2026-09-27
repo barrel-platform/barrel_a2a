@@ -4,7 +4,7 @@
 
 ### Changed
 
-- hackney 4.8.3 (was 4.7.4), h2 0.12.3 (was 0.12.0). Through them,
+- hackney 4.8.4 (was 4.7.4), h2 0.12.3 (was 0.12.0). Through them,
   quic 2.0.1 and webtransport 0.4.7.
 - rebar3_lint 6.0.0 (development only).
 
