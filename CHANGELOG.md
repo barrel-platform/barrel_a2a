@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.4
+
+### Changed
+
+- hackney 4.9.0 (was 4.8.4), h2 0.12.5 (was 0.12.3). Through them,
+  certifi 2.18.0, quic 2.1.2 and webtransport 0.4.8.
+
 ## 0.2.3
 
 ### Changed
