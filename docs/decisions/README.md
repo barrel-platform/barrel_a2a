@@ -16,3 +16,4 @@ Format: context, decision, consequences. Keep them to a page.
 - [0007](0007-resume-unfinished-tasks.md) The application may resume an unfinished task on start
 - [0008](0008-persist-push-configs.md) Push configs persist through the task store behaviour
 - [0009](0009-task-pids-are-not-persisted.md) Task pids are not persisted
+- [0010](0010-push-secrets-sealed-at-rest.md) Push secrets are sealed at rest

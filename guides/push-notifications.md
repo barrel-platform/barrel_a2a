@@ -141,6 +141,32 @@ webhook never hears how its task ends. When you persist tasks
 - Use a separate file from `task_store`. The option is ignored when
   `push_notifications` is off.
 
+### Webhook secrets at rest
+
+A config's `token` and `authentication.credentials` are never written
+to the store in clear. Give the server a 32-byte key and they are
+sealed with AES-256-GCM, so a config keeps working after a restart:
+
+```erlang
+push_notifications => #{secret_key => my_secrets:push_key()}   %% <<_:256>>
+```
+
+- Without `secret_key` the secrets stay in memory. After a restart a
+  config that had them is dropped, with a warning, because it could no
+  longer authenticate to its webhook; the client registers it again.
+  Configs without secrets are kept as before.
+- Load the key from your secret manager, not from the code or the
+  store's directory.
+- To rotate, pass a list: `secret_key => [NewKey, OldKey]`. New configs
+  are sealed with the first key; every key in the list opens. A config
+  no key opens is dropped on start.
+- A sealed value only opens for the config it was written for, so rows
+  cannot be swapped between configs.
+- A store written by 0.2.x holds secrets in clear. On the first start
+  with this release each such row is rewritten without them. DETS can
+  keep the old bytes in the file, so replace the file, or rotate the
+  webhook secrets, if those copies matter.
+
 ## Notes
 
 - The first event delivered is the `Task` snapshot, then
