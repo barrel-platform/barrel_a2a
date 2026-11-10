@@ -24,7 +24,7 @@ the advisory is published with credit to you unless you ask otherwise.
 
 ## Supported versions
 
-Fixes go into the latest release only. Upgrade to the newest 0.2.x
+Fixes go into the latest release only. Upgrade to the newest 0.3.x
 release to get them.
 
 ## Scope
