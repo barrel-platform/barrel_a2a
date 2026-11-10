@@ -22,7 +22,7 @@ import asyncio
 import contextlib
 import sys
 
-import uvicorn
+from gunicorn.app.base import BaseApplication
 from starlette.applications import Starlette
 
 from a2a.helpers import (
@@ -148,13 +148,25 @@ def build_app(port: int, binding: str) -> Starlette:
     return Starlette(routes=routes, lifespan=lifespan)
 
 
-class ReadyServer(uvicorn.Server):
-    def __init__(self, config: uvicorn.Config, port: int):
-        super().__init__(config)
-        self._port = port
+class ReadyServer(BaseApplication):
+    """Gunicorn with the native ASGI worker, one process, no config file."""
 
-    async def startup(self, sockets=None):
-        await super().startup(sockets)
+    def __init__(self, app: Starlette, port: int):
+        self._app = app
+        self._port = port
+        super().__init__()
+
+    def load_config(self):
+        self.cfg.set('bind', f'127.0.0.1:{self._port}')
+        self.cfg.set('worker_class', 'asgi')
+        self.cfg.set('workers', 1)
+        self.cfg.set('loglevel', 'warning')
+        self.cfg.set('when_ready', self._ready)
+
+    def load(self):
+        return self._app
+
+    def _ready(self, _arbiter):
         sys.stdout.write(f'READY {self._port}\n')
         sys.stdout.flush()
 
@@ -168,10 +180,7 @@ def main(argv):
     if binding not in ('jsonrpc', 'rest', 'both'):
         sys.stderr.write(__doc__)
         return 2
-    config = uvicorn.Config(
-        build_app(port, binding), host='127.0.0.1', port=port, log_level='warning'
-    )
-    ReadyServer(config, port).run()
+    ReadyServer(build_app(port, binding), port).run()
     return 0
 
 
