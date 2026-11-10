@@ -539,6 +539,7 @@ task(Id, State) ->
 %% because its final event was never delivered.
 backing_store_round_trip_test() ->
     {File, Spec} = backing_spec(),
+    Opts = (opts())#{secret_key => key(1)},
     Tasks = #{<<"live">> => working, <<"done">> => completed},
     TaskOf = fun(Id) ->
         case maps:find(Id, Tasks) of
@@ -546,31 +547,125 @@ backing_store_round_trip_test() ->
             error -> error
         end
     end,
-    {ok, S1, []} = barrel_a2a_push:open_store(Spec, barrel_a2a_push:normalize_opts(opts()), TaskOf),
-    {ok, Live} = barrel_a2a_push:create(S1, <<"live">>, config(), opts()),
-    {ok, Done} = barrel_a2a_push:create(S1, <<"done">>, config(), opts()),
-    {ok, _Gone} = barrel_a2a_push:create(S1, <<"gone">>, config(), opts()),
-    {ok, Deleted} = barrel_a2a_push:create(S1, <<"live">>, config(), opts()),
+    {ok, S1, []} = barrel_a2a_push:open_store(Spec, barrel_a2a_push:normalize_opts(Opts), TaskOf),
+    {ok, Live} = barrel_a2a_push:create(S1, <<"live">>, config(), Opts),
+    {ok, Done} = barrel_a2a_push:create(S1, <<"done">>, config(), Opts),
+    {ok, _Gone} = barrel_a2a_push:create(S1, <<"gone">>, config(), Opts),
+    {ok, Deleted} = barrel_a2a_push:create(S1, <<"live">>, config(), Opts),
     ok = barrel_a2a_push:delete(S1, <<"live">>, maps:get(<<"id">>, Deleted)),
     ok = barrel_a2a_push:close_store(S1),
     ets:delete(S1),
 
-    {ok, S2, Unsent} = barrel_a2a_push:open_store(Spec, opts(), TaskOf),
+    {ok, S2, Unsent} = barrel_a2a_push:open_store(Spec, Opts, TaskOf),
     ?assertEqual([<<"done">>], [barrel_a2a_task:id(T) || T <- Unsent]),
     ?assertEqual({ok, Live}, barrel_a2a_push:get(S2, <<"live">>, maps:get(<<"id">>, Live))),
     ?assertEqual({ok, Done}, barrel_a2a_push:get(S2, <<"done">>, maps:get(<<"id">>, Done))),
     {ok, [_], <<>>} = barrel_a2a_push:list(S2, <<"live">>, undefined, undefined),
     {ok, [], <<>>} = barrel_a2a_push:list(S2, <<"gone">>, undefined, undefined),
     %% The recorded options are the ones given at open.
-    ?assertEqual(opts(), barrel_a2a_push:opts(S2)),
+    ?assertEqual(Opts, barrel_a2a_push:opts(S2)),
     ok = barrel_a2a_push:close_store(S2),
     ets:delete(S2),
 
     %% The dropped config is gone from the backing store too.
-    {ok, S3, _} = barrel_a2a_push:open_store(Spec, opts(), fun(_) -> {ok, task(x, working)} end),
+    {ok, S3, _} = barrel_a2a_push:open_store(Spec, Opts, fun(_) -> {ok, task(x, working)} end),
     {ok, [], <<>>} = barrel_a2a_push:list(S3, <<"gone">>, undefined, undefined),
     ok = barrel_a2a_push:close_store(S3),
     file:delete(File).
+
+key(N) -> binary:copy(<<N>>, 32).
+
+secret_config() ->
+    (config())#{
+        <<"authentication">> => #{
+            <<"scheme">> => <<"Bearer">>, <<"credentials">> => <<"hook-secret">>
+        }
+    }.
+
+alive(_) -> {ok, task(x, working)}.
+
+%% Reopen the store at `File' with `Opts' and return the config `Id'.
+reopen(Spec, Opts, TaskId, Id) ->
+    {ok, S, _} = barrel_a2a_push:open_store(
+        Spec, barrel_a2a_push:normalize_opts(Opts), fun alive/1
+    ),
+    R = barrel_a2a_push:get(S, TaskId, Id),
+    ok = barrel_a2a_push:close_store(S),
+    ets:delete(S),
+    R.
+
+create_closed(Spec, Opts, Config) ->
+    {ok, S, _} = barrel_a2a_push:open_store(
+        Spec, barrel_a2a_push:normalize_opts(Opts), fun alive/1
+    ),
+    {ok, C} = barrel_a2a_push:create(S, ?TASK, Config, Opts),
+    ok = barrel_a2a_push:close_store(S),
+    ets:delete(S),
+    C.
+
+file_has(File, Needle) ->
+    {ok, Bin} = file:read_file(File),
+    binary:match(Bin, Needle) =/= nomatch.
+
+%% Sealed secrets never reach the file in clear and come back on open.
+secrets_sealed_at_rest_test() ->
+    {File, Spec} = backing_spec(),
+    Opts = (opts())#{secret_key => key(1)},
+    C = create_closed(Spec, Opts, secret_config()),
+    ?assertNot(file_has(File, <<"hook-secret">>)),
+    ?assertNot(file_has(File, <<"tok">>)),
+    ?assertEqual({ok, C}, reopen(Spec, Opts, ?TASK, maps:get(<<"id">>, C))),
+    file:delete(File).
+
+%% Without a key the secrets stay in memory; the config cannot
+%% authenticate after a restart and is dropped. One without secrets
+%% survives as before.
+secrets_without_key_not_persisted_test() ->
+    {File, Spec} = backing_spec(),
+    C = create_closed(Spec, opts(), secret_config()),
+    Plain = create_closed(Spec, opts(), #{<<"url">> => ?URL}),
+    ?assertNot(file_has(File, <<"hook-secret">>)),
+    ?assertEqual(error, reopen(Spec, opts(), ?TASK, maps:get(<<"id">>, C))),
+    ?assertEqual({ok, Plain}, reopen(Spec, opts(), ?TASK, maps:get(<<"id">>, Plain))),
+    file:delete(File).
+
+%% A rotated key list opens configs sealed under an older key; an
+%% unknown key drops them.
+secret_key_rotation_test() ->
+    {File, Spec} = backing_spec(),
+    C = create_closed(Spec, (opts())#{secret_key => key(1)}, secret_config()),
+    Id = maps:get(<<"id">>, C),
+    ?assertEqual({ok, C}, reopen(Spec, (opts())#{secret_key => [key(2), key(1)]}, ?TASK, Id)),
+    ?assertEqual(error, reopen(Spec, (opts())#{secret_key => key(3)}, ?TASK, Id)),
+    file:delete(File).
+
+%% A row an earlier release wrote in clear is used, and rewritten
+%% sealed.
+legacy_clear_row_resealed_test() ->
+    {File, Spec} = backing_spec(),
+    {ok, B} = barrel_a2a_task_store:open(Spec),
+    Config = (secret_config())#{<<"id">> => <<"c1">>, <<"taskId">> => ?TASK},
+    ok = barrel_a2a_task_store:put(B, #{id => <<"c1">>, task_id => ?TASK, config => Config}),
+    {ok, Row0} = barrel_a2a_task_store:get(B, <<"c1">>),
+    ok = barrel_a2a_task_store:close(B),
+    ?assertEqual(Config, maps:get(config, Row0)),
+    Opts = (opts())#{secret_key => key(1)},
+    ?assertEqual({ok, Config}, reopen(Spec, Opts, ?TASK, <<"c1">>)),
+    {ok, B2} = barrel_a2a_task_store:open(Spec),
+    {ok, Row} = barrel_a2a_task_store:get(B2, <<"c1">>),
+    ok = barrel_a2a_task_store:close(B2),
+    ?assertNot(maps:is_key(<<"token">>, maps:get(config, Row))),
+    ?assert(is_binary(maps:get(secrets, Row))),
+    file:delete(File).
+
+check_secret_key_test_() ->
+    [
+        ?_assertEqual(ok, barrel_a2a_push:check_secret_key(#{})),
+        ?_assertEqual(ok, barrel_a2a_push:check_secret_key(#{secret_key => key(1)})),
+        ?_assertEqual(ok, barrel_a2a_push:check_secret_key(#{secret_key => [key(1), key(2)]})),
+        ?_assertMatch({error, _}, barrel_a2a_push:check_secret_key(#{secret_key => <<"short">>})),
+        ?_assertMatch({error, _}, barrel_a2a_push:check_secret_key(#{secret_key => []}))
+    ].
 
 no_backing_store_test() ->
     {ok, S, []} = barrel_a2a_push:open_store(undefined, opts(), fun(_) -> error end),

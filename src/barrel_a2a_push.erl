@@ -13,6 +13,13 @@
 %%% option `push_config_store'), every config written to or removed
 %%% from the table is written through to it, and the table is filled
 %%% from it on open, so configs outlive a restart like their tasks.
+%%% The config `token' and `authentication.credentials' never reach
+%%% the backing store in clear: with the `secret_key' option they are
+%%% sealed with AES-256-GCM, bound to the config's ids, and opened on
+%%% load; without it they stay in memory only, and a config that had
+%%% them is dropped on the next start, since it could no longer
+%%% authenticate to its webhook. A row written in clear by an earlier
+%%% release is rewritten on load.
 %%%
 %%% `notify/3' is the fan-out point the task process calls with each
 %%% `StreamResponse': every config of the task gets its own ordered
@@ -31,13 +38,16 @@
 
 -export([new_store/0, open_store/3, close_store/1, store_owner/1]).
 -export([create/4, get/3, list/4, delete/3, delete_task/2, notify/3]).
--export([validate_url/2, target/2, normalize_opts/1]).
+-export([validate_url/2, target/2, normalize_opts/1, check_secret_key/1]).
 -export([opts/1, take_overflow/2]).
 
 -type store() :: ets:table().
 -type opts() :: #{
     allow => fun((binary()) -> boolean()) | [binary()],
     ssrf_guard => boolean(),
+    %% 32-byte AES-256-GCM key sealing webhook secrets in the backing
+    %% store; with a list the first seals and all are tried on load.
+    secret_key => binary() | [binary()],
     %% Replaces DNS resolution of webhook hosts for the SSRF guard.
     resolve => fun((binary()) -> {ok, [inet:ip_address()]} | error),
     require_https => boolean(),
@@ -59,6 +69,7 @@
 -export_type([store/0, opts/0, target/0]).
 
 -define(DEFAULT_PAGE, 50).
+-define(SEAL_VERSION, 1).
 -define(MAX_PAGE, 1000).
 
 %%--------------------------------------------------------------------
@@ -78,6 +89,25 @@ normalize_opts(Opts) when is_map(Opts) ->
         max_backoff => 60000
     },
     maps:merge(Defaults, Opts).
+
+%% @doc Check the `secret_key' option: absent, a 32-byte binary, or a
+%% non-empty list of them.
+-spec check_secret_key(map()) -> ok | {error, {secret_key, term()}}.
+check_secret_key(#{secret_key := Key}) ->
+    case keys(Key) of
+        [_ | _] = Keys ->
+            case lists:all(fun(K) -> is_binary(K) andalso byte_size(K) =:= 32 end, Keys) of
+                true -> ok;
+                false -> {error, {secret_key, must_be_32_bytes}}
+            end;
+        _ ->
+            {error, {secret_key, must_be_32_bytes}}
+    end;
+check_secret_key(_) ->
+    ok.
+
+keys(Keys) when is_list(Keys) -> Keys;
+keys(Key) -> [Key].
 
 %% @doc The options recorded by the last `create/4' on this store,
 %% used by `notify/3' to start workers.
@@ -126,16 +156,24 @@ open_store(Spec, Opts, TaskOf) ->
     end.
 
 load(Store, Backing, TaskOf) ->
+    Opts = opts(Store),
     Unsent = lists:foldl(
-        fun(#{id := Id, task_id := TaskId, config := Config}, Acc) ->
-            case TaskOf(TaskId) of
-                {ok, Task} ->
+        fun(#{id := Id, task_id := TaskId} = Row, Acc) ->
+            case {TaskOf(TaskId), unseal(Row, Opts)} of
+                {{ok, Task}, {ok, Config, Rewrite}} ->
                     true = ets:insert(Store, {{TaskId, Id}, Config}),
+                    _ = Rewrite andalso persist(Backing, Id, TaskId, Config, Opts),
                     case barrel_a2a_task:is_terminal(Task) of
                         true -> Acc#{TaskId => Task};
                         false -> Acc
                     end;
-                error ->
+                {{ok, _}, {drop, Why}} ->
+                    logger:warning(
+                        "a2a push: dropping config ~s of task ~s: ~s", [Id, TaskId, Why]
+                    ),
+                    barrel_a2a_task_store:delete(Backing, Id),
+                    Acc;
+                {error, _} ->
                     barrel_a2a_task_store:delete(Backing, Id),
                     Acc
             end
@@ -184,11 +222,7 @@ create(Store, TaskId, Config, Opts0) when is_map(Config) ->
                     Config1 = Config#{<<"id">> => Id, <<"taskId">> => TaskId},
                     true = ets:insert(Store, {opts, Opts}),
                     true = ets:insert(Store, {{TaskId, Id}, Config1}),
-                    write_through(Store, fun(B) ->
-                        barrel_a2a_task_store:put(B, #{
-                            id => Id, task_id => TaskId, config => Config1
-                        })
-                    end),
+                    write_through(Store, fun(B) -> persist(B, Id, TaskId, Config1, Opts) end),
                     {ok, Config1};
                 {error, Why} ->
                     {error, barrel_a2a_error:invalid(<<"url">>, Why)}
@@ -235,6 +269,100 @@ delete(Store, TaskId, Id) ->
     %% The worker reads and clears this itself, but it may be gone.
     _ = ets:delete(Store, {overflow, Id}),
     stop_worker(Store, Id).
+
+%%--------------------------------------------------------------------
+%% Secrets at rest
+%%--------------------------------------------------------------------
+
+%% The row for the backing store: the config without its secrets, and
+%% the secrets sealed under the first key, or `not_persisted'.
+persist(Backing, Id, TaskId, Config, Opts) ->
+    {Clear, Secrets} = split_secrets(Config),
+    Row0 = #{id => Id, task_id => TaskId, config => Clear},
+    Row =
+        case {map_size(Secrets), maps:get(secret_key, Opts, undefined)} of
+            {0, _} -> Row0;
+            {_, undefined} -> Row0#{secrets => not_persisted};
+            {_, Key} -> Row0#{secrets => seal(hd(keys(Key)), aad(TaskId, Id), Secrets)}
+        end,
+    barrel_a2a_task_store:put(Backing, Row).
+
+%% `{ok, Config, Rewrite}': `Rewrite' when the row held secrets in
+%% clear, written by a release that did not seal them.
+unseal(#{secrets := not_persisted}, _) ->
+    {drop, <<"its webhook credentials were not persisted (no secret_key)">>};
+unseal(#{id := Id, task_id := TaskId, config := Config, secrets := Blob}, Opts) ->
+    Keys = keys(maps:get(secret_key, Opts, [])),
+    case open(Keys, aad(TaskId, Id), Blob) of
+        {ok, Secrets} -> {ok, join_secrets(Config, Secrets), false};
+        error -> {drop, <<"its webhook credentials cannot be opened with secret_key">>}
+    end;
+unseal(#{config := Config}, _) ->
+    {_, Secrets} = split_secrets(Config),
+    {ok, Config, map_size(Secrets) > 0}.
+
+split_secrets(Config) ->
+    {Config1, S1} =
+        case maps:take(<<"token">>, Config) of
+            {T, C} -> {C, #{token => T}};
+            error -> {Config, #{}}
+        end,
+    case Config1 of
+        #{<<"authentication">> := #{<<"credentials">> := Cred} = A} ->
+            {Config1#{<<"authentication">> := maps:remove(<<"credentials">>, A)}, S1#{
+                credentials => Cred
+            }};
+        _ ->
+            {Config1, S1}
+    end.
+
+join_secrets(Config, Secrets) ->
+    Config1 =
+        case Secrets of
+            #{token := T} -> Config#{<<"token">> => T};
+            _ -> Config
+        end,
+    case {Secrets, Config1} of
+        {#{credentials := Cred}, #{<<"authentication">> := A}} ->
+            Config1#{<<"authentication">> := A#{<<"credentials">> => Cred}};
+        _ ->
+            Config1
+    end.
+
+%% The ids are authenticated data: a sealed blob only opens for the
+%% config it was written for.
+aad(TaskId, Id) -> <<TaskId/binary, 0, Id/binary>>.
+
+seal(Key, Aad, Secrets) ->
+    IV = crypto:strong_rand_bytes(12),
+    {Cipher, Tag} = crypto:crypto_one_time_aead(
+        aes_256_gcm, Key, IV, term_to_binary(Secrets), Aad, 16, true
+    ),
+    <<?SEAL_VERSION, (key_id(Key))/binary, IV/binary, Tag/binary, Cipher/binary>>.
+
+open(Keys, Aad, <<?SEAL_VERSION, KeyId:8/binary, IV:12/binary, Tag:16/binary, Cipher/binary>>) ->
+    case [K || K <- Keys, key_id(K) =:= KeyId] of
+        [Key | _] ->
+            case crypto:crypto_one_time_aead(aes_256_gcm, Key, IV, Cipher, Aad, Tag, false) of
+                error -> error;
+                Plain -> decode_secrets(Plain)
+            end;
+        [] ->
+            error
+    end;
+open(_, _, _) ->
+    error.
+
+decode_secrets(Plain) ->
+    try binary_to_term(Plain, [safe]) of
+        #{} = Secrets -> {ok, Secrets};
+        _ -> error
+    catch
+        error:badarg -> error
+    end.
+
+key_id(Key) ->
+    binary:part(crypto:hash(sha256, Key), 0, 8).
 
 write_through(Store, Fun) ->
     case backing(Store) of

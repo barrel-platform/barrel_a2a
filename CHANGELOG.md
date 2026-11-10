@@ -22,6 +22,14 @@
   `auth => none`. Without authentication every caller is the same
   principal and can see and change every other caller's tasks; the
   authentication guide now says so.
+- Push webhook secrets (`token` and `authentication.credentials`) are
+  no longer written in clear to `push_config_store`. With the new
+  `secret_key` push option they are sealed with AES-256-GCM and survive
+  a restart; a list of keys supports rotation. Without a key they stay
+  in memory only, and a config that had them is dropped on the next
+  start, so the client has to register it again. Rows written in clear
+  by 0.2.x are rewritten on first start; DETS may keep the old bytes,
+  so replace the file or rotate those secrets if that matters.
 - `resolve` push option to replace DNS resolution for the SSRF guard.
 
 ### Changed

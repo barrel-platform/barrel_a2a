@@ -556,7 +556,10 @@ push_opt(false, _) ->
 push_opt(true, Sup) ->
     push_opt(#{}, Sup);
 push_opt(Opts, PushSup) when is_map(Opts) ->
-    barrel_a2a_push:normalize_opts(Opts#{sup => PushSup});
+    case barrel_a2a_push:check_secret_key(Opts) of
+        ok -> barrel_a2a_push:normalize_opts(Opts#{sup => PushSup});
+        {error, Reason} -> throw({invalid_option, {push_notifications, Reason}})
+    end;
 push_opt(Other, _) ->
     throw({invalid_option, {push_notifications, Other}}).
 
