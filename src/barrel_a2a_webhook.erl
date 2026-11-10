@@ -47,7 +47,7 @@ authenticate(Headers, Opts) ->
     end.
 
 token_ok(Headers, #{token := Expected}) ->
-    header(<<"x-a2a-notification-token">>, Headers) =:= Expected;
+    secret_equal(header(<<"x-a2a-notification-token">>, Headers), Expected);
 token_ok(_, _) ->
     true.
 
@@ -57,9 +57,16 @@ authorization_ok(Headers, #{authorization := Check}) when is_function(Check, 1) 
         _ -> false
     end;
 authorization_ok(Headers, #{authorization := Expected}) when is_binary(Expected) ->
-    header(<<"authorization">>, Headers) =:= Expected;
+    secret_equal(header(<<"authorization">>, Headers), Expected);
 authorization_ok(_, _) ->
     true.
+
+%% Constant-time: comparing digests keeps the time independent of
+%% where the values differ and of their lengths.
+secret_equal(Got, Expected) when is_binary(Got) ->
+    crypto:hash_equals(crypto:hash(sha256, Got), crypto:hash(sha256, Expected));
+secret_equal(_, _) ->
+    false.
 
 decode(Body, Opts) ->
     case barrel_a2a_json:decode(Body) of
