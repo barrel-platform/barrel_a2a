@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Push webhooks could be steered to internal addresses by DNS
+  rebinding: the host was checked once at registration and resolved
+  again at delivery. Every delivery now checks the host again and
+  connects to the address it checked, over HTTP/1.1, so a name that
+  later resolves to a loopback or private address fails the delivery.
+- A webhook host that does not resolve is now refused at registration
+  instead of accepted.
+
+### Added
+
+- `resolve` push option to replace DNS resolution for the SSRF guard.
+
 ## 0.2.4
 
 ### Changed

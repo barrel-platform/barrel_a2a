@@ -12,8 +12,14 @@
 %%% client sees events in order (at-least-once). The worker also
 %%% stops after delivering a final event, removing its config.
 %%%
-%%% `post/3' does the single HTTP call. An `http_post' fun in the
-%%% options replaces hackney, which lets tests run without a network.
+%%% `post/3' does the single HTTP call. Before each call the url goes
+%%% through the SSRF guard again ({@link barrel_a2a_push:target/2}) and
+%%% hackney connects to the address the guard checked, over HTTP/1.1,
+%%% with the original host in `Host' and in TLS SNI and certificate
+%%% verification. A host that now resolves to a blocked address fails
+%%% the delivery like any other error. An `http_post' fun in the
+%%% options replaces hackney and this check, which lets tests run
+%%% without a network.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_push_delivery).
@@ -63,7 +69,7 @@ post(#{<<"url">> := Url} = Config, Event, Opts0) ->
     Headers = headers(Config),
     Result =
         case maps:get(http_post, Opts, undefined) of
-            undefined -> hackney_post(Url, Headers, Body, maps:get(timeout, Opts));
+            undefined -> guarded_post(Url, Headers, Body, Opts);
             Fun when is_function(Fun, 3) -> Fun(Url, Headers, Body)
         end,
     case Result of
@@ -93,18 +99,51 @@ headers(Config) ->
         end,
     Base ++ Auth ++ Token.
 
+guarded_post(Url, Headers, Body, Opts) ->
+    case barrel_a2a_push:target(Url, Opts) of
+        {ok, Target} ->
+            {Url1, Headers1, PinOpts} = pin(Target, Url, Headers),
+            hackney_post(Url1, Headers1, Body, PinOpts, maps:get(timeout, Opts));
+        {error, Reason} ->
+            {error, {blocked, Reason}}
+    end.
+
+%% Connect to the checked address and keep the name for the peer. No
+%% pool: a pooled TLS connection to a shared address could carry a
+%% request for another name.
+pin(direct, Url, Headers) ->
+    {Url, Headers, []};
+pin({pinned, IP, Host}, Url, Headers) ->
+    #{scheme := Scheme} = Parsed = uri_string:parse(Url),
+    Authority =
+        case Parsed of
+            #{port := Port} when is_integer(Port) ->
+                <<Host/binary, ":", (integer_to_binary(Port))/binary>>;
+            _ ->
+                Host
+        end,
+    Url1 = uri_string:recompose(Parsed#{host => list_to_binary(inet:ntoa(IP))}),
+    Tls =
+        case string:lowercase(Scheme) of
+            <<"https">> -> [{ssl_options, [{server_name_indication, binary_to_list(Host)}]}];
+            _ -> []
+        end,
+    {Url1, [{<<"Host">>, Authority} | Headers], [{pool, false}, {protocols, [http1]} | Tls]}.
+
 %% Only the status matters here, and a receiver we do not control is on
 %% the other end. Async mode lets the connection be closed the moment
 %% the status line arrives, so a hostile webhook cannot answer a
 %% notification with a body large enough to matter; hackney 4.7 ignores
 %% `with_body' and would otherwise collect all of it.
-hackney_post(Url, Headers, Body, Timeout) ->
-    HackneyOpts = [
-        async,
-        {follow_redirect, false},
-        {connect_timeout, Timeout},
-        {recv_timeout, Timeout}
-    ],
+hackney_post(Url, Headers, Body, PinOpts, Timeout) ->
+    HackneyOpts =
+        PinOpts ++
+            [
+                async,
+                {follow_redirect, false},
+                {connect_timeout, Timeout},
+                {recv_timeout, Timeout}
+            ],
     try hackney:request(post, Url, Headers, Body, HackneyOpts) of
         {ok, Ref} -> await_status(Ref, Timeout);
         {ok, Status, _RespHeaders, _RespBody} -> {ok, Status};
