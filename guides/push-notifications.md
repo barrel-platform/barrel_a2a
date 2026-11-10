@@ -30,8 +30,17 @@ to fill `max_queue` is treated as failing: delivery is at-least-once,
 so events are never silently discarded to make room. The queue depth
 counts toward `max_failures` like any other failure, and a receiver
 that never keeps up loses its configuration. Hosts in `allow` skip the SSRF guard; the
-guard refuses `localhost`, URLs with credentials, and hosts resolving
-to loopback, private, link-local, CGNAT or unspecified addresses.
+guard refuses `localhost`, URLs with credentials, hosts that do not
+resolve, and hosts resolving to loopback, private, link-local, CGNAT or
+unspecified addresses.
+
+The guard runs again before every delivery, and the POST goes to the
+address it just checked, over HTTP/1.1, with the original host name in
+`Host` and in TLS verification. A webhook host that passes at
+registration and later resolves to an internal address (DNS rebinding)
+fails the delivery instead of reaching that address. To resolve names
+yourself, for example against a split-horizon DNS, pass
+`resolve => fun((Host) -> {ok, [inet:ip_address()]} | error)`.
 
 ## Register from the client
 

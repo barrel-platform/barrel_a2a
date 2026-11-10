@@ -157,6 +157,63 @@ validate_url_test_() ->
             )}
     ].
 
+%% A resolver that answers from a fixed table.
+resolver(Table) ->
+    fun(Host) ->
+        case maps:find(Host, Table) of
+            {ok, IPs} -> {ok, IPs};
+            error -> error
+        end
+    end.
+
+target_test_() ->
+    Resolve = resolver(#{
+        <<"hook.test">> => [{93, 184, 216, 34}, {16#2606, 16#2800, 0, 0, 0, 0, 0, 1}],
+        <<"mixed.test">> => [{93, 184, 216, 34}, {10, 0, 0, 1}],
+        <<"inner.test">> => [{192, 168, 0, 10}]
+    }),
+    Opts = #{resolve => Resolve},
+    [
+        {"name pinned to its first address",
+            ?_assertEqual(
+                {ok, {pinned, {93, 184, 216, 34}, <<"hook.test">>}},
+                barrel_a2a_push:target(<<"https://Hook.test/x">>, Opts)
+            )},
+        {"one blocked address rejects the name",
+            ?_assertEqual(
+                {error, <<"url host resolves to a blocked address">>},
+                barrel_a2a_push:target(<<"https://mixed.test/x">>, Opts)
+            )},
+        {"private name rejected",
+            ?_assertMatch({error, _}, barrel_a2a_push:target(<<"https://inner.test/x">>, Opts))},
+        {"unresolvable name rejected",
+            ?_assertEqual(
+                {error, <<"url host does not resolve">>},
+                barrel_a2a_push:validate_url(<<"https://gone.test/x">>, Opts)
+            )},
+        {"ip literal connects as given",
+            ?_assertEqual({ok, direct}, barrel_a2a_push:target(<<"https://8.8.8.8/x">>, Opts))},
+        {"allowlisted name is not resolved",
+            ?_assertEqual(
+                {ok, direct},
+                barrel_a2a_push:target(<<"https://gone.test/x">>, Opts#{allow => [<<"gone.test">>]})
+            )}
+    ].
+
+%% Rebinding: the name passes at registration, then resolves to a
+%% private address; delivery re-checks and never connects.
+rebinding_blocked_at_delivery_test() ->
+    Tab = ets:new(dns, [public]),
+    true = ets:insert(Tab, {ip, {93, 184, 216, 34}}),
+    Resolve = fun(_) -> {ok, [ets:lookup_element(Tab, ip, 2)]} end,
+    Url = <<"https://rebind.test/hook">>,
+    ?assertEqual(ok, barrel_a2a_push:validate_url(Url, #{resolve => Resolve})),
+    true = ets:insert(Tab, {ip, {127, 0, 0, 1}}),
+    ?assertEqual(
+        {error, {blocked, <<"url host resolves to a blocked address">>}},
+        barrel_a2a_push_delivery:post(config(Url), #{}, #{resolve => Resolve})
+    ).
+
 %%--------------------------------------------------------------------
 %% Delivery worker (http_post override)
 %%--------------------------------------------------------------------

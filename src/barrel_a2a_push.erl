@@ -19,22 +19,27 @@
 %%% delivery worker (see {@link barrel_a2a_push_delivery}).
 %%%
 %%% `validate_url/2' is the SSRF guard (13.2): only `http' and
-%%% `https' URLs whose host does not resolve to a loopback, private,
-%%% link-local or unspecified address are accepted, unless the host
-%%% is allowlisted.
+%%% `https' URLs whose host resolves, and only to public addresses
+%%% (not loopback, private, link-local or unspecified), are accepted,
+%%% unless the host is allowlisted. `target/2' runs the same check at
+%%% delivery time and names the address that passed it, so the
+%%% connection goes to that address and a name that later resolves
+%%% elsewhere (DNS rebinding) cannot redirect it.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(barrel_a2a_push).
 
 -export([new_store/0, open_store/3, close_store/1, store_owner/1]).
 -export([create/4, get/3, list/4, delete/3, delete_task/2, notify/3]).
--export([validate_url/2, normalize_opts/1]).
+-export([validate_url/2, target/2, normalize_opts/1]).
 -export([opts/1, take_overflow/2]).
 
 -type store() :: ets:table().
 -type opts() :: #{
     allow => fun((binary()) -> boolean()) | [binary()],
     ssrf_guard => boolean(),
+    %% Replaces DNS resolution of webhook hosts for the SSRF guard.
+    resolve => fun((binary()) -> {ok, [inet:ip_address()]} | error),
     require_https => boolean(),
     timeout => pos_integer(),
     max_failures => pos_integer(),
@@ -47,7 +52,11 @@
     sup => pid()
 }.
 
--export_type([store/0, opts/0]).
+%% Where a delivery connects: the url as given, or the address the
+%% guard checked, with the original host for `Host' and TLS.
+-type target() :: direct | {pinned, inet:ip_address(), binary()}.
+
+-export_type([store/0, opts/0, target/0]).
 
 -define(DEFAULT_PAGE, 50).
 -define(MAX_PAGE, 1000).
@@ -307,7 +316,18 @@ take_overflow(Store, Id) ->
 %%--------------------------------------------------------------------
 
 -spec validate_url(binary(), opts()) -> ok | {error, binary()}.
-validate_url(Url, Opts0) when is_binary(Url) ->
+validate_url(Url, Opts) ->
+    case target(Url, Opts) of
+        {ok, _} -> ok;
+        Error -> Error
+    end.
+
+%% @doc Check `Url' as `validate_url/2' does and say where to connect.
+%% A guarded host name is resolved now; every address must pass and
+%% the first is returned, so the caller connects to an address that
+%% was checked rather than resolving the name again.
+-spec target(binary(), opts()) -> {ok, target()} | {error, binary()}.
+target(Url, Opts0) when is_binary(Url) ->
     Opts = normalize_opts(Opts0),
     case uri_string:parse(Url) of
         #{scheme := Scheme, host := Host} = Parsed when is_binary(Host), Host =/= <<>> ->
@@ -320,7 +340,7 @@ validate_url(Url, Opts0) when is_binary(Url) ->
         _ ->
             {error, <<"url is not an absolute http(s) url">>}
     end;
-validate_url(_, _) ->
+target(_, _) ->
     {error, <<"url must be a string">>}.
 
 check_scheme(<<"https">>, _) ->
@@ -335,11 +355,11 @@ check_scheme(_, _) ->
 check_host(Host, Parsed, Opts) ->
     case allowed(Host, Opts) of
         true ->
-            ok;
+            {ok, direct};
         false ->
             case maps:get(ssrf_guard, Opts) of
-                false -> ok;
-                true -> guard_host(Host, maps:get(userinfo, Parsed, undefined))
+                false -> {ok, direct};
+                true -> guard_host(Host, maps:get(userinfo, Parsed, undefined), Opts)
             end
     end.
 
@@ -353,22 +373,30 @@ allowed(Host, #{allow := Hosts}) when is_list(Hosts) ->
 allowed(_, _) ->
     false.
 
-guard_host(_Host, UserInfo) when UserInfo =/= undefined ->
+guard_host(_Host, UserInfo, _) when UserInfo =/= undefined ->
     {error, <<"url must not carry credentials">>};
-guard_host(Host, _) ->
+guard_host(Host, _, Opts) ->
     case is_local_name(Host) of
         true ->
             {error, <<"url host is not allowed">>};
         false ->
-            case resolve(Host) of
-                {ok, IPs} ->
-                    case lists:any(fun is_blocked_ip/1, IPs) of
-                        true -> {error, <<"url host resolves to a blocked address">>};
-                        false -> ok
-                    end;
-                error ->
-                    ok
+            case inet:parse_address(binary_to_list(Host)) of
+                {ok, IP} -> guard_ips([IP], direct);
+                {error, _} -> guard_name(Host, Opts)
             end
+    end.
+
+guard_name(Host, Opts) ->
+    Resolve = maps:get(resolve, Opts, fun resolve/1),
+    case Resolve(Host) of
+        {ok, [IP | _] = IPs} -> guard_ips(IPs, {pinned, IP, Host});
+        _ -> {error, <<"url host does not resolve">>}
+    end.
+
+guard_ips(IPs, Target) ->
+    case lists:any(fun is_blocked_ip/1, IPs) of
+        true -> {error, <<"url host resolves to a blocked address">>};
+        false -> {ok, Target}
     end.
 
 is_local_name(<<"localhost">>) -> true;
@@ -376,14 +404,9 @@ is_local_name(Host) -> binary:longest_common_suffix([Host, <<".localhost">>]) =:
 
 resolve(Host) ->
     Str = binary_to_list(Host),
-    case inet:parse_address(Str) of
-        {ok, IP} ->
-            {ok, [IP]};
-        {error, _} ->
-            case {inet:getaddrs(Str, inet), inet:getaddrs(Str, inet6)} of
-                {{error, _}, {error, _}} -> error;
-                {A, B} -> {ok, addrs(A) ++ addrs(B)}
-            end
+    case {inet:getaddrs(Str, inet), inet:getaddrs(Str, inet6)} of
+        {{error, _}, {error, _}} -> error;
+        {A, B} -> {ok, addrs(A) ++ addrs(B)}
     end.
 
 addrs({ok, IPs}) -> IPs;
