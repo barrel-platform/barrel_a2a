@@ -18,6 +18,10 @@
 
 ### Added
 
+- A warning at start when the server listens beyond loopback with
+  `auth => none`. Without authentication every caller is the same
+  principal and can see and change every other caller's tasks; the
+  authentication guide now says so.
 - `resolve` push option to replace DNS resolution for the SSRF guard.
 
 ## 0.2.4
