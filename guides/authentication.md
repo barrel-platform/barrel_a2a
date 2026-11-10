@@ -34,6 +34,15 @@ Shapes:
 | `{Module, State}` | `Module:authenticate(Request, State)` |
 | `fun((Request) -> ...)` | `Request = #{headers, op, binding, peer}` |
 
+With `none`, every caller is the same principal, so owner scoping
+(below) cannot keep one caller's tasks from another: any caller can
+read, list, continue, cancel and subscribe to every task, and manage
+its push configs. The default listener binds `127.0.0.1` for this
+reason. Before you bind another address, set `auth`, or, when you
+embed the engine, set `principal` per request (see the embedding
+guide). The server logs a
+warning when it starts listening beyond loopback with `auth => none`.
+
 Return `{ok, Principal}`, `{error, unauthenticated}` (401 with a
 `WWW-Authenticate` challenge built from the card's security schemes)
 or `{error, forbidden}` (403). Any other reason or a crash is logged

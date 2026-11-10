@@ -420,6 +420,7 @@ build_config(InstSup, Card0, Opts) ->
     Push = push_opt(maps:get(push_notifications, Opts, false), PushSup),
     Http = maps:merge(#{port => ?DEFAULT_PORT, ip => {127, 0, 0, 1}}, maps:get(http, Opts, #{})),
     Listen = maps:get(listen, Opts, true),
+    ok = warn_anonymous(Auth, Listen, maps:get(ip, Http)),
     Tls = maps:get(tls, Http, undefined) =/= undefined,
     Card =
         case is_map(Card0) of
@@ -485,6 +486,30 @@ build_config(InstSup, Card0, Opts) ->
         }
     },
     {Cfg#{push_notify => push_notify_fun(Cfg)}, Resumed, Unsent}.
+
+%% Without auth every caller is the same `anonymous' principal, so
+%% owner scoping cannot separate them: say so when the listener is
+%% reachable from other hosts.
+warn_anonymous(none, true, Ip) ->
+    case is_loopback(Ip) of
+        true ->
+            ok;
+        false ->
+            logger:warning(
+                "a2a server listens on ~s with auth => none: every caller is the same "
+                "anonymous principal and can see and change every other caller's tasks",
+                [format_ip(Ip)]
+            )
+    end;
+warn_anonymous(_, _, _) ->
+    ok.
+
+is_loopback({127, _, _, _}) -> true;
+is_loopback({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
+is_loopback(_) -> false.
+
+format_ip(Ip) when is_tuple(Ip) -> inet:ntoa(Ip);
+format_ip(Ip) -> io_lib:format("~0p", [Ip]).
 
 required({ok, V}, _) -> V;
 required({error, Reason}, Key) -> throw({invalid_option, {Key, Reason}}).
