@@ -5,6 +5,6 @@
   "description": "Reference A2A implementation driven by barrel_a2a_interop_SUITE",
   "dependencies": {
     "@a2a-js/sdk": "1.2.0",
-    "express": "^5.1.0"
+    "express": "5.3.0"
   }
 }

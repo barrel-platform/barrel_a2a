@@ -24,6 +24,11 @@
   authentication guide now says so.
 - `resolve` push option to replace DNS resolution for the SSRF guard.
 
+### Changed
+
+- CI actions are pinned to commit hashes, and the JavaScript interop
+  dependencies are locked (development only).
+
 ## 0.2.4
 
 ### Changed

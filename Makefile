@@ -69,7 +69,7 @@ interop-python: interop-setup
 # JavaScript SDK interop. Same shape: `interop-js-setup' is idempotent
 # and the group skips when INTEROP_NODE is unset.
 interop-js-setup:
-	cd test/interop/js && npm install --no-audit --no-fund
+	cd test/interop/js && npm ci --no-audit --no-fund
 
 interop-js: interop-js-setup
 	INTEROP_NODE=$$(command -v node) \
