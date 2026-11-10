@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
+
+Security release following an audit. One breaking change: with a
+persistent `push_config_store` and no `secret_key`, push configs that
+carry a token or credentials are dropped on restart and must be
+registered again. Set `secret_key` to keep them.
 
 ### Fixed
 
