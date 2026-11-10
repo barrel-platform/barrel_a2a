@@ -11,6 +11,10 @@
   later resolves to a loopback or private address fails the delivery.
 - A webhook host that does not resolve is now refused at registration
   instead of accepted.
+- The webhook receiver compared the notification token and
+  `Authorization` value with plain equality, which can leak how much of
+  a guess matched through timing. Both are now compared in constant
+  time.
 
 ### Added
 
