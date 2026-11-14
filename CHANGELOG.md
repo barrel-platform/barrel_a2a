@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1
+
+### Changed
+
+- h1 0.11.0 (was 0.9.1), h2 0.17.0 (was 0.12.5), hackney 4.11.1 (was
+  4.9.0). Through them, quic 2.7.0 and webtransport 0.5.8. These are the
+  versions livery 0.13.0 requires, so barrel_a2a and livery can run in
+  the same release again; with 0.3.0 one of them ran on versions it was
+  not built for.
+
 ## 0.3.0
 
 Security release following an audit. One breaking change: with a
