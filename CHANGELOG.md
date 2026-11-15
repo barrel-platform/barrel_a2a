@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.2
+
+### Changed
+
+- h2 0.18.0 (was 0.17.0) and hackney 4.12.1 (was 4.11.1). Through them,
+  quic 3.1.0, webtransport 0.5.11 and certifi 2.19.0. livery 0.13.0
+  still pins the older versions, so an application that also depends on
+  livery needs a livery release on these versions first.
+- The example apps now declare h1 0.11.0, the version barrel_a2a uses;
+  they still asked for 0.9.1.
+
 ## 0.3.1
 
 ### Changed
